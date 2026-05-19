@@ -1,12 +1,12 @@
 """
-dt_report.py
+dt_report_full.py
 
 Generate exploratory markdown report
-for cleaned Aletheia dataset.
+for cleaned Aletheia full dataset.
 
 Outputs:
-- reports/aletheia_report.md
-- reports/figures/*
+- reports/aletheia_full_report.md
+- reports/figures/full_report/*
 """
 
 import sys
@@ -22,11 +22,11 @@ from loguru import logger
 # Configuration
 # ------------------------------------------------------------
 
-INPUT_FILE = "data/aletheia_clean.csv"
+INPUT_FILE = "data/aletheia_clean_full.csv"
 
-REPORT_FILE = "reports/aletheia_report.md"
-FIGURES_DIR = "reports/figures"
-LOG_FILE = "logs/dt_report.log"
+REPORT_FILE = "reports/aletheia_full_report.md"
+FIGURES_DIR = "reports/figures/full_report"
+LOG_FILE = "logs/dt_report_full.log"
 
 DATE_COLUMN = "date_parsed"
 TEXT_COLUMN = "text_content"

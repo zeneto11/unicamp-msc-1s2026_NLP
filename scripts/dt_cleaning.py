@@ -20,7 +20,8 @@ from loguru import logger
 
 INPUT_FILE = "data/timebin_sampled_telegram.csv"
 
-OUTPUT_CLEAN = "data/aletheia_clean.csv"
+OUTPUT_CLEAN_FULL = "data/aletheia_clean_full.csv"
+OUTPUT_PORTUGUESE = "data/aletheia_clean_pt.csv"
 OUTPUT_SPILL_TEXT = "data/aletheia_spill_text.csv"
 OUTPUT_SPILL_NOISE = "data/aletheia_spill_noise.csv"
 
@@ -31,6 +32,14 @@ TEXT_COLUMNS = [
     "media_description",
     "media_title",
     "reply_to",
+]
+
+NA_VALUES = [
+    "NA",
+    "",
+    "None",
+    "nan",
+    "NaN",
 ]
 
 NA_COLUMNS = [
@@ -44,6 +53,36 @@ NA_COLUMNS = [
     "media_title",
     "media_path",
     "media_url",
+    "user_id",
+    "views",
+    "time_bin",
+]
+
+PORTUGUESE_COLUMNS = [
+    "message_id",
+    "user_id",
+    "channel_id",
+    "text_content",
+    "date_parsed",
+    "time_bin",
+    "reply_to",
+    "forward_from",
+    "forward_from_n_forwards",
+    "forward_from_reactions",
+    "forward_from_views",
+    "n_forwards",
+    "reactions",
+    "views",
+]
+
+NUMERIC_COLUMNS = [
+    "date",
+    "forward_from_n_forwards",
+    "forward_from_reactions",
+    "forward_from_views",
+    "n_forwards",
+    "reactions",
+    "views",
 ]
 
 CHANNEL_PATTERN = r"^<CHANNEL_HASH:[a-f0-9]+>$"
@@ -54,6 +93,18 @@ MESSAGE_PATTERN = r"^<CHANNEL_HASH:[a-f0-9]+>_[0-9]+$"
 # Logging setup
 # ------------------------------------------------------------
 
+# Create folders needed by logger and outputs before configuring loguru
+Path(LOG_FILE).parent.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+Path(OUTPUT_PORTUGUESE).parent.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+# Remove default logger so only the configured formats are used
 logger.remove()
 
 LOG_FORMAT = (
@@ -63,12 +114,14 @@ LOG_FORMAT = (
     "{message}"
 )
 
+# Log to terminal with colors
 logger.add(
     sys.stdout,
     format=LOG_FORMAT,
     colorize=True,
 )
 
+# Log to file for reproducibility
 logger.add(
     LOG_FILE,
     format=LOG_FORMAT,
@@ -84,24 +137,35 @@ logger.add(
 # ------------------------------------------------------------
 
 def load_raw_text(path: Path) -> str:
-    """Reads file bytes, handles corrupted headers, and decodes to UTF-8."""
+    """
+    Reads file bytes, handles corrupted headers, and decodes to text.
+
+    Args:
+        path:
+            Path to the raw CSV file.
+
+    Returns:
+        Decoded CSV text.
+    """
 
     # Read file content as raw bytes
     raw = path.read_bytes()
 
     # Check for and remove corrupted leading byte
-    if raw[0] == 0xFF:
+    if raw and raw[0] == 0xFF:
         logger.info("Detected corrupted leading byte (0xFF). Removing.")
         raw = raw[1:]
 
-    # Decode bytes to string, replacing errors to prevent crashes
-    text = raw.decode(
-        "utf-8",
-        errors="replace",
-    )
+    # Decode using cp1252 to preserve Portuguese accents from the original file
+    # Do not use utf-8 with errors="replace" here, because it creates � and destroys accents
+    text = raw.decode("cp1252", errors="replace")
 
-    # Log successful decoding step
-    logger.info("Raw file decoded successfully.")
+    # Count replacement characters to monitor remaining decoding damage
+    replacement_count = text.count("�")
+
+    # Log successful decoding step and any remaining replacement characters
+    logger.info("Raw file decoded using cp1252.")
+    logger.info(f"Replacement characters after decoding: {replacement_count}")
 
     return text
 
@@ -111,7 +175,16 @@ def load_raw_text(path: Path) -> str:
 # ------------------------------------------------------------
 
 def repair_text(value):
-    """Attempts to fix encoding issues and mojibake in a string."""
+    """
+    Attempts to fix common text glitches without removing accented characters.
+
+    Args:
+        value:
+            Raw text value.
+
+    Returns:
+        Repaired text value.
+    """
 
     # Return immediately if value is null
     if pd.isna(value):
@@ -120,38 +193,27 @@ def repair_text(value):
     # Ensure the input is treated as a string
     s = str(value)
 
-    # Iteratively attempt to fix encoding up to 3 times
-    for _ in range(3):
-        previous = s
+    # Apply ftfy to fix common mojibake patterns such as Ã£ -> ã
+    # Avoid latin1 encode/decode with errors="ignore", because that removed accents
+    s = fix_text(s)
 
-        try:
-            # Re-encode and decode to resolve latin1/utf8 conflicts
-            s = (
-                s.encode(
-                    "latin1",
-                    errors="ignore",
-                )
-                .decode(
-                    "utf8",
-                    errors="ignore",
-                )
-            )
-
-        except Exception:
-            pass
-
-        # Apply ftfy library to fix common text glitches
-        s = fix_text(s)
-
-        # Stop if no further changes are detected
-        if s == previous:
-            break
+    # Remove null bytes and trim outer whitespace
+    s = (s.replace("\x00", "").strip())
 
     return s
 
 
 def clean_text_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Applies the repair_text function to all configured text columns."""
+    """
+    Applies the repair_text function to all configured text columns.
+
+    Args:
+        df:
+            Input dataframe.
+
+    Returns:
+        Dataframe with repaired text columns.
+    """
 
     logger.info("Repairing text columns.")
 
@@ -170,11 +232,21 @@ def clean_text_columns(df: pd.DataFrame) -> pd.DataFrame:
 # ------------------------------------------------------------
 
 def load_dataframe(text: str) -> pd.DataFrame:
-    """Parses raw text into a Pandas DataFrame with specific CSV settings."""
+    """
+    Parses raw text into a Pandas DataFrame with specific CSV settings.
+
+    Args:
+        text:
+            Decoded CSV text.
+
+    Returns:
+        Parsed dataframe.
+    """
 
     logger.info("Parsing CSV structure.")
 
     # Read CSV from string buffer with flexible error handling
+    # keep_default_na=False preserves original "NA" strings until normalize_nulls()
     df = pd.read_csv(
         StringIO(text),
         engine="python",
@@ -207,8 +279,19 @@ def load_dataframe(text: str) -> pd.DataFrame:
 # Structural validation
 # ------------------------------------------------------------
 
-def split_valid_invalid(df: pd.DataFrame):
-    """Separates rows with valid Telegram IDs from malformed rows."""
+def split_valid_invalid(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Separates rows with valid Telegram IDs from malformed rows.
+
+    Args:
+        df:
+            Parsed dataframe.
+
+    Returns:
+        Tuple containing valid rows and malformed rows.
+    """
 
     logger.info("Validating identifiers.")
 
@@ -239,12 +322,23 @@ def split_valid_invalid(df: pd.DataFrame):
 # Spill classification
 # ------------------------------------------------------------
 
-def classify_spill_rows(bad: pd.DataFrame):
-    """Categorizes invalid rows into text spills or random noise."""
+def classify_spill_rows(
+    bad: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Categorizes invalid rows into text spills or random noise.
+
+    Args:
+        bad:
+            Invalid rows.
+
+    Returns:
+        Tuple containing content-rich spills and structural noise.
+    """
 
     logger.info("Classifying spill rows.")
 
-    # Identify if 'channel_id' actually contains text (spilled from content)
+    # Identify if 'channel_id' actually contains text spilled from content
     bad["channel_has_text"] = bad["channel_id"].str.contains(
         r"[A-Za-zÀ-ÿ]{4,}",
         regex=True,
@@ -263,54 +357,20 @@ def classify_spill_rows(bad: pd.DataFrame):
 
 
 # ------------------------------------------------------------
-# Date normalization
-# ------------------------------------------------------------
-
-def repair_dates(df: pd.DataFrame) -> pd.DataFrame:
-    """Converts numeric and string timestamps into standard datetime objects."""
-
-    logger.info("Repairing temporal fields.")
-
-    # Convert the primary 'date' to numeric, handling errors
-    df["date"] = pd.to_numeric(
-        df["date"],
-        errors="coerce",
-    )
-
-    # Parse numeric 'date' as milliseconds
-    df["date_parsed"] = pd.to_datetime(
-        df["date"],
-        unit="ms",
-        errors="coerce",
-    )
-
-    # Convert 'collected_date' column to datetime
-    df["collected_date"] = pd.to_datetime(
-        df["collected_date"],
-        errors="coerce",
-    )
-
-    # Convert 'edit_date' column to datetime
-    df["edit_date"] = pd.to_datetime(
-        df["edit_date"],
-        errors="coerce",
-    )
-
-    # Convert 'time_bin' column to datetime
-    df["time_bin"] = pd.to_datetime(
-        df["time_bin"],
-        errors="coerce",
-    )
-
-    return df
-
-
-# ------------------------------------------------------------
 # Missing normalization
 # ------------------------------------------------------------
 
 def normalize_nulls(df: pd.DataFrame) -> pd.DataFrame:
-    """Replaces placeholder strings with actual Pandas null values."""
+    """
+    Replaces placeholder strings with actual Pandas null values.
+
+    Args:
+        df:
+            Input dataframe.
+
+    Returns:
+        Dataframe with normalized missing values.
+    """
 
     logger.info("Normalizing missing values.")
 
@@ -319,7 +379,7 @@ def normalize_nulls(df: pd.DataFrame) -> pd.DataFrame:
         # Standardize "NA", empty strings, and "None" to pd.NA
         if col in df.columns:
             df[col] = df[col].replace(
-                ["NA", "", "None"],
+                NA_VALUES,
                 pd.NA,
             )
 
@@ -327,11 +387,163 @@ def normalize_nulls(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ------------------------------------------------------------
+# Date and numeric normalization
+# ------------------------------------------------------------
+
+def normalize_types(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Converts numeric and string timestamps into standard types.
+
+    Args:
+        df:
+            Input dataframe.
+
+    Returns:
+        Dataframe with normalized date and numeric columns.
+    """
+
+    logger.info("Normalizing dates and numeric fields.")
+
+    # Convert numeric columns from strings to numeric values
+    for col in NUMERIC_COLUMNS:
+        if col in df.columns:
+            df[col] = pd.to_numeric(
+                df[col],
+                errors="coerce",
+            )
+
+    # Convert the primary Unix timestamp in milliseconds into datetime
+    if "date" in df.columns:
+        df["date_parsed"] = pd.to_datetime(
+            df["date"],
+            unit="ms",
+            errors="coerce",
+        )
+
+    # Convert date-like string columns into datetime
+    for col in [
+        "collected_date",
+        "edit_date",
+        "time_bin",
+    ]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(
+                df[col],
+                errors="coerce",
+            )
+
+    return df
+
+
+# ------------------------------------------------------------
+# Portuguese selection
+# ------------------------------------------------------------
+
+def select_pt_messages(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Selects Portuguese messages and keeps only analysis columns.
+
+    Args:
+        df:
+            Clean full dataframe.
+
+    Returns:
+        Portuguese-only dataframe with selected columns.
+    """
+
+    logger.info("Selecting Portuguese messages.")
+
+    # Select only Portuguese messages
+    selected = df[df["language"] == "Portuguese"].copy()
+
+    logger.info(f"Portuguese rows before ID filtering: {len(selected)}")
+
+    # Remove rows without required ID fields
+    selected = selected.dropna(
+        subset=[
+            "message_id",
+            "user_id",
+            "channel_id",
+        ]
+    )
+
+    # Reorder columns and drop fields not needed for the next phase
+    selected = selected[PORTUGUESE_COLUMNS].copy()
+
+    # Log final shape of the selected corpus
+    logger.info(f"Portuguese selected rows: {len(selected)}")
+    logger.info(f"Portuguese selected columns: {len(selected.columns)}")
+
+    return selected
+
+
+# ------------------------------------------------------------
 # Reporting
 # ------------------------------------------------------------
 
-def log_summary(df, good, bad, spill_text, spill_noise):
-    """Logs a detailed statistical summary of the cleaning process."""
+def log_null_report(df: pd.DataFrame, name: str):
+    """
+    Logs null counts for a dataframe.
+
+    Args:
+        df:
+            Input dataframe.
+
+        name:
+            Name of the report section.
+
+    Returns:
+        None.
+    """
+
+    logger.info(f"===== NULL REPORT: {name} =====")
+
+    # Compute and log null values by column
+    nulls = (
+        df.isna()
+        .sum()
+        .sort_values(
+            ascending=False,
+        )
+    )
+
+    for col, count in nulls.items():
+        logger.info(f"{col}: {count}")
+
+
+def log_summary(
+    df: pd.DataFrame,
+    good: pd.DataFrame,
+    selected: pd.DataFrame,
+    bad: pd.DataFrame,
+    spill_text: pd.DataFrame,
+    spill_noise: pd.DataFrame,
+):
+    """
+    Logs a detailed statistical summary of the cleaning process.
+
+    Args:
+        df:
+            Parsed full dataframe.
+
+        good:
+            Structurally valid full dataframe.
+
+        selected:
+            Final Portuguese selected dataframe.
+
+        bad:
+            Structurally invalid dataframe.
+
+        spill_text:
+            Invalid rows classified as text spills.
+
+        spill_noise:
+            Invalid rows classified as parser noise.
+
+    Returns:
+        None.
+    """
 
     logger.info("===== DATASET REPORT =====")
 
@@ -339,40 +551,83 @@ def log_summary(df, good, bad, spill_text, spill_noise):
     logger.info(f"Rows loaded: {len(df)}")
     logger.info(f"Valid rows: {len(good)}")
     logger.info(f"Invalid rows: {len(bad)}")
-    logger.info(
-        f"Spill rate: {(len(bad) / len(df)) * 100:.2f}%"
-    )
+    logger.info(f"Spill rate: {(len(bad) / len(df)) * 100:.2f}%")
     logger.info(f"Text spill: {len(spill_text)}")
     logger.info(f"Noise spill: {len(spill_noise)}")
+
+    logger.info("===== PORTUGUESE SELECTION =====")
+
+    # Report selected Portuguese corpus size
+    logger.info(f"Selected rows: {len(selected)}")
+    logger.info(f"Selected columns: {len(selected.columns)}")
 
     logger.info("===== FINAL QA =====")
 
     # Log metrics for duplicates, missing data, and date ranges
     logger.info(
-        f"Duplicate messages: "
-        f"{good['message_id'].duplicated().sum()}"
+        f"Duplicate selected messages: "
+        f"{selected['message_id'].duplicated().sum()}"
     )
 
     logger.info(
-        f"Missing text: "
-        f"{good['text_content'].isna().sum()}"
+        f"Missing selected text: "
+        f"{selected['text_content'].isna().sum()}"
     )
 
     logger.info(
-        f"Missing dates: "
-        f"{good['date_parsed'].isna().sum()}"
+        f"Missing selected dates: "
+        f"{selected['date_parsed'].isna().sum()}"
     )
 
     logger.info(
-        f"Unique channels: "
-        f"{good['channel_id'].nunique()}"
+        f"Unique selected channels: "
+        f"{selected['channel_id'].nunique()}"
     )
 
     logger.info(
-        f"Range: "
-        f"{good['date_parsed'].min()} -> "
-        f"{good['date_parsed'].max()}"
+        f"Unique selected users: "
+        f"{selected['user_id'].nunique()}"
     )
+
+    logger.info(
+        f"Selected range: "
+        f"{selected['date_parsed'].min()} -> "
+        f"{selected['date_parsed'].max()}"
+    )
+
+
+def log_encoding_sample(df: pd.DataFrame, message_id: str):
+    """
+    Logs a known message sample to verify accent preservation.
+
+    Args:
+        df:
+            Selected dataframe.
+
+        message_id:
+            Message ID to inspect.
+
+    Returns:
+        None.
+    """
+
+    # Check whether the message exists in the selected dataset
+    if message_id not in set(df["message_id"]):
+        logger.warning(f"Sample message not found: {message_id}")
+        return
+
+    # Retrieve sample text for encoding validation
+    sample = (
+        df.loc[
+            df["message_id"] == message_id,
+            "text_content",
+        ]
+        .iloc[0]
+    )
+
+    # Log only a sample slice to keep the log readable
+    logger.info("===== ENCODING SAMPLE =====")
+    logger.info(f'\n{sample[:500]}')
 
 
 # ------------------------------------------------------------
@@ -380,9 +635,14 @@ def log_summary(df, good, bad, spill_text, spill_noise):
 # ------------------------------------------------------------
 
 def main():
-    """Executes the full data recovery, cleaning, and saving workflow."""
+    """
+    Executes the full recovery, cleaning, selection, and saving workflow.
 
-    logger.info("Starting Telegram recovery.")
+    Returns:
+        None.
+    """
+
+    logger.info("Starting Aletheia cleaning pipeline.")
 
     # Load and parse the raw input file
     text = load_raw_text(Path(INPUT_FILE))
@@ -392,39 +652,69 @@ def main():
     good, bad = split_valid_invalid(df)
     spill_text, spill_noise = classify_spill_rows(bad)
 
-    # Apply data cleaning and normalization steps
+    # Apply text cleaning before selection so Portuguese accents are preserved
     good = clean_text_columns(good)
+
+    # Normalize textual null markers before filtering and exporting
     good = normalize_nulls(good)
-    good = repair_dates(good)
+
+    # Normalize dates and numeric fields after null cleanup
+    good = normalize_types(good)
+
+    # Select only Portuguese rows and keep columns needed for the next phase
+    selected = select_pt_messages(good)
 
     # Log final summary statistics
     log_summary(
-        df,
-        good,
-        bad,
-        spill_text,
-        spill_noise,
+        df=df,
+        good=good,
+        selected=selected,
+        bad=bad,
+        spill_text=spill_text,
+        spill_noise=spill_noise,
     )
+
+    # Log selected dataset null report
+    log_null_report(selected, "PORTUGUESE SELECTED")
+
+    # Log known sample message to verify accents are preserved
+    log_encoding_sample(selected, "<CHANNEL_HASH:27401c0ac3256345fb61>_357")
 
     logger.info("Saving outputs.")
 
-    # Export cleaned data to CSV
+    # Export full cleaned data for backup/reference
     good.to_csv(
-        OUTPUT_CLEAN,
+        OUTPUT_CLEAN_FULL,
         index=False,
+        encoding="utf-8",
+    )
+
+    # Export selected Portuguese dataset for downstream analysis
+    selected.to_csv(
+        OUTPUT_PORTUGUESE,
+        index=False,
+        encoding="utf-8",
     )
 
     # Export text spills for manual review
     spill_text.to_csv(
         OUTPUT_SPILL_TEXT,
         index=False,
+        encoding="utf-8",
     )
 
     # Export structural noise for record keeping
     spill_noise.to_csv(
         OUTPUT_SPILL_NOISE,
         index=False,
+        encoding="utf-8",
     )
+
+    # Log output paths
+    logger.info(f"Full clean dataset saved: {OUTPUT_CLEAN_FULL}")
+    logger.info(f"Portuguese selected dataset saved: {OUTPUT_PORTUGUESE}")
+    logger.info(f"Text spill dataset saved: {OUTPUT_SPILL_TEXT}")
+    logger.info(f"Noise spill dataset saved: {OUTPUT_SPILL_NOISE}")
 
     logger.info("Recovery completed.")
 
