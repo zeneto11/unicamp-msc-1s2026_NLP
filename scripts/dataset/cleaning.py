@@ -13,10 +13,12 @@ import pandas as pd
 from ftfy import fix_text
 from loguru import logger
 
+from scripts.utils.logger import setup_logger
 
 # ------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------
+setup_logger(__file__)
 
 INPUT_FILE = "data/timebin_sampled_telegram.csv"
 
@@ -24,8 +26,6 @@ OUTPUT_CLEAN_FULL = "data/aletheia_clean_full.csv"
 OUTPUT_PORTUGUESE = "data/aletheia_clean_pt.csv"
 OUTPUT_SPILL_TEXT = "data/aletheia_spill_text.csv"
 OUTPUT_SPILL_NOISE = "data/aletheia_spill_noise.csv"
-
-LOG_FILE = "logs/dt_cleaning.log"
 
 TEXT_COLUMNS = [
     "text_content",
@@ -88,47 +88,9 @@ NUMERIC_COLUMNS = [
 CHANNEL_PATTERN = r"^<CHANNEL_HASH:[a-f0-9]+>$"
 MESSAGE_PATTERN = r"^<CHANNEL_HASH:[a-f0-9]+>_[0-9]+$"
 
-
-# ------------------------------------------------------------
-# Logging setup
-# ------------------------------------------------------------
-
-# Create folders needed by logger and outputs before configuring loguru
-Path(LOG_FILE).parent.mkdir(
-    parents=True,
-    exist_ok=True,
-)
-
 Path(OUTPUT_PORTUGUESE).parent.mkdir(
     parents=True,
     exist_ok=True,
-)
-
-# Remove default logger so only the configured formats are used
-logger.remove()
-
-LOG_FORMAT = (
-    "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
-    "<level>{level:<8}</level> | "
-    "{function:<25} | "
-    "{message}"
-)
-
-# Log to terminal with colors
-logger.add(
-    sys.stdout,
-    format=LOG_FORMAT,
-    colorize=True,
-)
-
-# Log to file for reproducibility
-logger.add(
-    LOG_FILE,
-    format=LOG_FORMAT,
-    rotation="10 MB",
-    retention=5,
-    level="INFO",
-    enqueue=True,
 )
 
 

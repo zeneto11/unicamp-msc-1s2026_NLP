@@ -12,21 +12,25 @@ Outputs:
 import sys
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from loguru import logger
+import matplotlib.pyplot as plt
 
+from scripts.utils.logger import setup_logger
 
 # ------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------
+setup_logger(__file__)
 
 INPUT_FILE = "data/aletheia_clean_full.csv"
 
 REPORT_FILE = "reports/aletheia_full_report.md"
 FIGURES_DIR = "reports/figures/full_report"
-LOG_FILE = "logs/dt_report_full.log"
+
+Path(FIGURES_DIR).mkdir(parents=True, exist_ok=True)
+Path(REPORT_FILE).parent.mkdir(parents=True, exist_ok=True)
 
 DATE_COLUMN = "date_parsed"
 TEXT_COLUMN = "text_content"
@@ -87,39 +91,9 @@ NUMERIC_COLUMNS = [
 
 
 # ------------------------------------------------------------
-# Logging setup
-# ------------------------------------------------------------
-
-Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
-
-Path(FIGURES_DIR).mkdir(parents=True, exist_ok=True)
-
-Path(REPORT_FILE).parent.mkdir(parents=True, exist_ok=True)
-
-logger.remove()
-
-LOG_FORMAT = (
-    "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
-    "<level>{level:<8}</level> | "
-    "{function:<25} | "
-    "{message}"
-)
-
-logger.add(sys.stdout, format=LOG_FORMAT, colorize=True)
-
-logger.add(
-    LOG_FILE,
-    format=LOG_FORMAT,
-    rotation="10 MB",
-    retention=5,
-    level="INFO",
-    enqueue=True,
-)
-
-
-# ------------------------------------------------------------
 # Loading and normalization
 # ------------------------------------------------------------
+
 
 def load_dataset(path: Path) -> pd.DataFrame:
     """

@@ -40,4 +40,6 @@ dist/
 
 # Data
 data/
+figures/
 reports/
+import/
