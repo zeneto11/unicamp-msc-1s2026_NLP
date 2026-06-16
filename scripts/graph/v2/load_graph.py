@@ -1,10 +1,9 @@
-import sys
 from pathlib import Path
 
 from loguru import logger
 from neo4j import GraphDatabase
 
-from scripts.graph.v1.config import CONFIG
+from scripts.graph.v2.config import CONFIG
 from scripts.utils.logger import setup_logger
 
 # ------------------------------------------------------------
@@ -14,6 +13,18 @@ from scripts.utils.logger import setup_logger
 setup_logger(__file__)
 
 CYPHER_DIR = Path(__file__).resolve().parent / "cypher"
+
+# Each load step lists the artifact CSVs it requires. A step is skipped when any
+# required artifact is missing, so partial pipeline runs still load cleanly.
+# constraints/metadata have no data dependencies and always run.
+LOAD_STEPS: list[tuple[str, list[str]]] = [
+    ("constraints.cypher", []),
+    ("metadata.cypher", []),
+    ("load_communities.cypher", ["communities.csv", "channel_community.csv"]),
+    ("load_topics.cypher", ["topics.csv", "message_topics.csv"]),
+    ("load_similarity.cypher", ["message_similarity.csv"]),
+    ("load_emotions.cypher", ["message_emotions.csv"]),
+]
 
 # ------------------------------------------------------------
 # Load graph into Neo4j
@@ -31,11 +42,7 @@ def split_cypher_statements(text: str) -> list[str]:
         List of stripped Cypher statements.
     """
     # Split on semicolons and discard empty statements.
-    return [
-        stmt.strip()
-        for stmt in text.split(";")
-        if stmt.strip()
-    ]
+    return [stmt.strip() for stmt in text.split(";") if stmt.strip()]
 
 
 def run_file(driver, filename: str) -> None:
@@ -59,9 +66,32 @@ def run_file(driver, filename: str) -> None:
         driver.execute_query(statement, database_=CONFIG.neo4j_database)
 
 
+def artifacts_present(required: list[str]) -> bool:
+    """
+    Check that every required artifact exists in the V2 import directory.
+
+    Args:
+        required: Artifact file names the load step depends on.
+
+    Returns:
+        True when all required artifacts are present.
+    """
+    missing = [
+        name for name in required
+        if not (CONFIG.graph_import_dir / name).exists()
+    ]
+    if missing:
+        logger.warning(f"Missing artifacts {missing}; skipping dependent load step.")
+        return False
+    return True
+
+
 def main() -> None:
     """
-    Connect to Neo4j and run the graph import Cypher files.
+    Connect to Neo4j and run the V2 enrichment Cypher files in order.
+
+    Steps whose artifacts are absent are skipped so the loader tolerates partial
+    analysis runs (for example loading only the emotion layer).
 
     Args:
         None.
@@ -76,19 +106,18 @@ def main() -> None:
     )
 
     try:
-        # Verify the connection before running import scripts.
+        # Verify the connection before running enrichment scripts.
         driver.verify_connectivity()
 
-        # Run schema, metadata, node, and relationship loading scripts.
-        run_file(driver, "constraints.cypher")
-        run_file(driver, "metadata.cypher")
-        run_file(driver, "load_nodes.cypher")
-        run_file(driver, "load_relationships.cypher")
+        # Run each load step when its required artifacts are present.
+        for filename, required in LOAD_STEPS:
+            if artifacts_present(required):
+                run_file(driver, filename)
     finally:
         # Always close the driver after import execution.
         driver.close()
 
-    logger.info("Graph loaded")
+    logger.info("Graph V2 enrichment loaded")
 
 
 if __name__ == "__main__":

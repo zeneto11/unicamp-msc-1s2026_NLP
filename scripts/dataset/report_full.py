@@ -425,6 +425,22 @@ def build_main_column_summary(df: pd.DataFrame) -> pd.DataFrame:
 # Plot helpers
 # ------------------------------------------------------------
 
+def report_image_path(filename: str) -> str:
+    """
+    Builds markdown-relative path for a figure.
+
+    Args:
+        filename:
+            Figure filename.
+
+    Returns:
+        Relative path from the report file.
+    """
+
+    # Match figure paths to the markdown report location
+    return str(Path("figures") / "full_report" / filename)
+
+
 def save_bar_plot(
     series: pd.Series,
     title: str,
@@ -485,7 +501,7 @@ def save_bar_plot(
     plt.savefig(fig_path, dpi=150)
     plt.close()
 
-    return str(Path("figures") / filename)
+    return report_image_path(filename)
 
 
 def save_hist_plot(
@@ -549,7 +565,7 @@ def save_hist_plot(
     plt.savefig(fig_path, dpi=150)
     plt.close()
 
-    return str(Path("figures") / filename)
+    return report_image_path(filename)
 
 
 def save_line_plot(
@@ -598,7 +614,7 @@ def save_line_plot(
     plt.savefig(fig_path, dpi=150)
     plt.close()
 
-    return str(Path("figures") / filename)
+    return report_image_path(filename)
 
 
 # ------------------------------------------------------------

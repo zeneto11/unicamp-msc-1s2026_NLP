@@ -549,6 +549,118 @@ def build_edges(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     }
 
 
+def build_interacts_with(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build aggregated INTERACTS_WITH channel-to-channel edges from three signals.
+
+    Signals:
+    - Shared users: both channels share a user that posted in each.
+    - Forwarding: a message in the target channel was forwarded from the source.
+    - Replies: a message in the target channel replied to one in the source.
+
+    Args:
+        df: Normalized message DataFrame.
+
+    Returns:
+        DataFrame with one directed row per (source, target) channel pair.
+    """
+    # Signal 1: shared users — cross-join each user's active channels.
+    user_ch = df[["user_id", "channel_id"]].drop_duplicates()
+    shared = (
+        user_ch.rename(columns={"channel_id": "source"})
+        .merge(user_ch.rename(columns={"channel_id": "target"}), on="user_id")
+    )
+    shared = shared[shared["source"] != shared["target"]]
+    shared_counts = (
+        shared.groupby(["source", "target"])["user_id"]
+        .nunique()
+        .reset_index(name="shared_users_count")
+    )
+
+    # Signal 2: forwarding — source is forward_from_channel, target is channel_id.
+    fwd_mask = (
+        df["forward_from_channel"].notna()
+        & (df["forward_from_channel"].astype("string").str.len() > 0)
+    )
+    fwd_pairs = (
+        df.loc[fwd_mask, ["forward_from_channel", "channel_id"]]
+        .copy()
+        .rename(columns={"forward_from_channel": "source", "channel_id": "target"})
+    )
+    fwd_pairs = fwd_pairs[fwd_pairs["source"] != fwd_pairs["target"]]
+    fwd_counts = (
+        fwd_pairs.groupby(["source", "target"])
+        .size()
+        .reset_index(name="forward_count")
+    )
+
+    # Signal 3: replies — source is reply_to_channel, target is channel_id.
+    reply_mask = (
+        df["reply_to_channel"].notna()
+        & (df["reply_to_channel"].astype("string").str.len() > 0)
+    )
+    reply_pairs = (
+        df.loc[reply_mask, ["reply_to_channel", "channel_id"]]
+        .copy()
+        .rename(columns={"reply_to_channel": "source", "channel_id": "target"})
+    )
+    reply_pairs = reply_pairs[reply_pairs["source"] != reply_pairs["target"]]
+    reply_counts = (
+        reply_pairs.groupby(["source", "target"])
+        .size()
+        .reset_index(name="reply_count")
+    )
+
+    # Union all unique (source, target) pairs, then left-join each signal.
+    all_pairs = (
+        pd.concat(
+            [
+                shared_counts[["source", "target"]],
+                fwd_counts[["source", "target"]],
+                reply_counts[["source", "target"]],
+            ],
+            ignore_index=True,
+        )
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
+
+    result = (
+        all_pairs
+        .merge(shared_counts, on=["source", "target"], how="left")
+        .merge(fwd_counts, on=["source", "target"], how="left")
+        .merge(reply_counts, on=["source", "target"], how="left")
+    )
+
+    result["shared_users_count"] = result["shared_users_count"].fillna(0).astype(int)
+    result["forward_count"] = result["forward_count"].fillna(0).astype(int)
+    result["reply_count"] = result["reply_count"].fillna(0).astype(int)
+    result["interaction_count"] = (
+        result["shared_users_count"]
+        + result["forward_count"]
+        + result["reply_count"]
+    )
+    result["interaction_weight"] = result["interaction_count"].astype(float)
+    result["has_shared_user_signal"] = result["shared_users_count"] > 0
+    result["has_forward_signal"] = result["forward_count"] > 0
+    result["has_reply_signal"] = result["reply_count"] > 0
+
+    return result[
+        [
+            "source",
+            "target",
+            "shared_users_count",
+            "forward_count",
+            "reply_count",
+            "interaction_count",
+            "interaction_weight",
+            "has_shared_user_signal",
+            "has_forward_signal",
+            "has_reply_signal",
+        ]
+    ]
+
+
 def print_summary(df: pd.DataFrame) -> None:
     """
     Print summary counts for the normalized raw dataset.
@@ -601,6 +713,9 @@ def main() -> None:
     # Write graph relationship CSV files.
     for filename, edge_df in build_edges(df).items():
         write_csv(edge_df, filename)
+
+    # Write derived channel-to-channel interaction graph.
+    write_csv(build_interacts_with(df), "interacts_with.csv")
 
     logger.info("Graph import CSV preparation complete.")
 

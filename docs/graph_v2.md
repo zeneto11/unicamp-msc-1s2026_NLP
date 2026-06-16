@@ -1,137 +1,54 @@
-# Graph V2 — Communities + Topics + Semantic Layer
+# Graph V2 — Communities, Topics & Semantic Layer
 
-Reference: **`graph_v1.md`**
+Reference: `graph_v1.md`
 
-V2 extends V1.
+## Goal
 
-Do **not rebuild** nodes and relations from V1.
+V2 extends Graph V1.
+
+V1 models:
+
+- actors
+- communication
+- diffusion
+- reply structure
 
 V2 adds:
 
-- community detection
-- topic extraction
-- semantic enrichment
-- diffusion communities
-- narrative analysis
+- community structure
+- topic structure
+- narrative similarity
+- community-level analysis
+
+V2 does not rebuild existing V1 nodes or relationships.
+
+It enriches the graph with new layers derived from V1.
 
 ---
 
-# Pipeline
+# Pipeline Overview
 
 ```text
 Graph V1
     ↓
-
 Community Detection
     ↓
-
-Community Assignment
+Topic Modeling
     ↓
-
-Topic Modeling per Community
-    ↓
-
 Semantic Enrichment
     ↓
-
+Similarity Analysis
+    ↓
+Statistical Analysis
+    ↓
 Graph V2
 ```
 
 ---
 
-# Step 1 — Community Detection
+# New NODE TYPES
 
-Input:
-
-```text
-Channel
-User
-Message
-
-POSTED
-ACTIVE_IN
-REPLIES_TO
-FORWARDED_FROM
-```
-
-From V1.
-
----
-
-## Community graph projection
-
-Create projection:
-
-```text
-Channel
-    +
-ACTIVE_IN
-    +
-FORWARDED_FROM
-    +
-REPLIES_TO
-```
-
-Derived graph:
-
-```text
-(Channel)
-      |
-INTERACTS_WITH
-      |
-(Channel)
-```
-
-Weights:
-
-```yaml
-shared_users_weight
-
-forward_weight
-
-reply_weight
-
-engagement_weight
-```
-
-Example:
-
-```cypher
-(Channel_A)-[:INTERACTS_WITH {
-    shared_users:20,
-    forwards:55,
-    replies:8
-}]->(Channel_B)
-```
-
----
-
-## Community algorithms
-
-Run:
-
-```text
-Leiden      (preferred)
-
-Louvain     (baseline)
-
-Infomap     (optional)
-```
-
-Output:
-
-```yaml
-community_id
-community_size
-density
-modularity_score
-```
-
----
-
-# New Node Type
-
-## Community
+## 1. Community
 
 ```yaml
 label: Community
@@ -139,113 +56,18 @@ label: Community
 id: community_id
 
 properties: size
-
   density
-
   modularity
-
   algorithm
-
-  created_at
 ```
 
-Example:
+Description:
 
-```cypher
-(:Community {
-    community_id:12,
-    size:18,
-    modularity:0.61
-})
-```
+Represents a detected community of channels and users derived from the V1 interaction graph.
 
 ---
 
-# New Relations
-
-## Channel assignment
-
-```yaml
-(Channel)-[:BELONGS_TO]->(Community)
-```
-
-Properties:
-
-```yaml
-membership_score
-```
-
-Example:
-
-```cypher
-(Channel_1)-[:BELONGS_TO]->(Community_12)
-```
-
----
-
-## User assignment
-
-Optional:
-
-```yaml
-(User)-[:PART_OF]->(Community)
-```
-
-Construction:
-
-```python
-majority(
-ACTIVE_IN channels
-)
-```
-
----
-
-# Step 2 — Topic Modeling
-
-Input:
-
-Messages grouped by:
-
-```python
-community_id
-```
-
-Do NOT run topic modeling globally.
-
-Run:
-
-```text
-Community
-      ↓
-messages
-      ↓
-topic extraction
-```
-
-Recommended:
-
-```text
-BERTopic
-
-Top2Vec
-
-LDA (baseline)
-```
-
-Preferred:
-
-```text
-BERTopic
-```
-
-because later similarity edges can reuse embeddings.
-
----
-
-# New Node Type
-
-## Topic
+## 2. Topic
 
 ```yaml
 label: Topic
@@ -253,31 +75,35 @@ label: Topic
 id: topic_id
 
 properties: label
-
   keywords
-
   coherence_score
-
   message_count
-
   embedding
 ```
 
-Example:
+Description:
 
-```cypher
-(:Topic {
-    topic_id:5,
-    label:"vaccines",
-    coherence_score:0.74
-})
-```
+Represents a latent topic extracted from messages belonging to a community.
 
 ---
 
-# New Relations
+# New RELATION TYPES
 
-## Message topic assignment
+## 1. Community Membership
+
+```yaml
+(Channel)-[:BELONGS_TO]->(Community)
+(User)-[:BELONGS_TO]->(Community)
+(Message)-[:BELONGS_TO]->(Community)
+```
+
+Description:
+
+Assigns a entity to its detected community.
+
+---
+
+## 2. Topic Assignment
 
 ```yaml
 (Message)-[:BELONGS_TO_TOPIC]->(Topic)
@@ -287,21 +113,16 @@ Properties:
 
 ```yaml
 probability
-
 rank
 ```
 
-Example:
+Description:
 
-```cypher
-(Message_100)-[:BELONGS_TO_TOPIC {
-    probability:0.88
-}]->(Topic_5)
-```
+Links messages to inferred topics.
 
 ---
 
-## Community topic dominance
+## 3. Community Topic Dominance
 
 ```yaml
 (Community)-[:DOMINATED_BY]->(Topic)
@@ -311,101 +132,16 @@ Properties:
 
 ```yaml
 share
-
 message_count
 ```
 
-Example:
+Description:
 
-```cypher
-(Community_12)-[:DOMINATED_BY {
-    share:0.41
-}]->(Topic_5)
-```
+Represents dominant topics inside a community.
 
 ---
 
-# Step 3 — Semantic Layer
-
-Add extracted entities.
-
----
-
-## Entity node
-
-```yaml
-label: Entity
-
-id: entity_id
-
-properties: text
-
-  type
-
-  frequency
-```
-
-Types:
-
-```text
-PERSON
-
-ORG
-
-LOCATION
-
-URL
-
-HASHTAG
-
-EVENT
-```
-
----
-
-## Relations
-
-Message mentions:
-
-```yaml
-(Message)-[:MENTIONS]->(Entity)
-```
-
-Community usage:
-
-```yaml
-(Community)-[:USES]->(Entity)
-```
-
-Topic references:
-
-```yaml
-(Topic)-[:REFERENCES]->(Entity)
-```
-
----
-
-# Step 4 — Similarity Layer
-
-Compute embeddings:
-
-Input:
-
-```text
-Message.text
-```
-
-Recommended:
-
-```text
-Sentence-BERT
-
-multilingual-e5
-
-BERTopic embeddings
-```
-
-Create:
+## 4. Message Similarity
 
 ```yaml
 (Message)-[:SIMILAR_TO]->(Message)
@@ -417,133 +153,556 @@ Properties:
 cosine_similarity
 ```
 
-Threshold:
+Description:
 
-```python
-similarity > 0.80
+Represents semantic similarity between messages.
+
+# Analysis Phases
+
+## Phase 1 — Community Detection
+
+Detect structural communities of channels using the V1 channel interaction layer.
+
+This phase identifies groups of channels that are closely connected through interaction patterns.
+
+### Input
+
+Use the V1 channel interaction graph:
+
+```text
+(Channel)-[:INTERACTS_WITH]->(Channel)
+```
+
+The `INTERACTS_WITH` relation summarizes structural signals from V1, including:
+
+- shared user activity
+- forwarding patterns
+- reply patterns
+- optional engagement-based interaction strength
+
+### Algorithms
+
+```text
+Leiden (preferred)
+Louvain
+```
+
+### Community Assignment
+
+Each channel receives a community assignment.
+
+```text
+(Channel)-[:BELONGS_TO]->(Community)
+```
+
+Users and messages are not directly clustered in this phase.
+
+They can be associated with communities indirectly:
+
+```text
+User → ACTIVE_IN → Channel → Community
+
+Message → IN_CHANNEL → Channel → Community
+```
+
+### Descriptive Keywords
+
+After communities are detected, generate descriptive keywords for each community.
+
+These keywords are based on the message content from the channels inside each community.
+
+Purpose:
+
+- provide a readable summary of each community
+- help inspect whether communities are coherent
+- support early interpretation before topic modeling
+- provide context for the next phase
+
+These are descriptive labels only.
+
+They should not be treated as formal topics.
+
+Formal topic extraction happens in Phase 2.
+
+Suggested output:
+
+```yaml
+community_name
+descriptive_keywords
+keyword_method
 ```
 
 Example:
 
-```cypher
-(m1)-[:SIMILAR_TO {
-    cosine:0.91
-}]->(m2)
+```yaml
+community_name: "vacinas · eleições · fraude · liberdade"
+
+descriptive_keywords:
+  - vacinas
+  - eleições
+  - fraude
+  - liberdade
+
+keyword_method: "descriptive_keywords"
 ```
 
 ---
 
-# Final V2 topology
+### Output
 
-```text
-                +----------------+
-                |   Community    |
-                +----------------+
-                   ^        |
-                   |        |
-              BELONGS_TO  DOMINATED_BY
-                   |        |
-                   |        v
-
-(User)      (Channel) ---> (Topic)
-   |             ^             |
-   |             |             |
-POSTED      IN_CHANNEL     REFERENCES
-   |             |             |
-   v             |             v
-
-(Message) ----MENTIONS----> (Entity)
-     |
-     |
-SIMILAR_TO
-     |
-     v
-
-(Message)
-```
-
----
-
-# Suggested config object
+This phase produces:
 
 ```yaml
-graph_name: telegram_v2
+community_id
+community_size
+algorithm
+modularity_score
+community_name
+descriptive_keywords
+```
 
-extends: telegram_v1
+Graph additions prepared by this phase:
 
-new_nodes:
-  Community:
-    key: community_id
+```text
+(:Community)
 
-  Topic:
-    key: topic_id
-
-  Entity:
-    key: entity_id
-
-new_edges:
-  BELONGS_TO:
-    source: channel_id
-    target: community_id
-
-  PART_OF:
-    source: user_id
-    target: community_id
-
-  BELONGS_TO_TOPIC:
-    source: message_id
-    target: topic_id
-
-  DOMINATED_BY:
-    source: community_id
-    target: topic_id
-
-  MENTIONS:
-    source: message_id
-    target: entity_id
-
-  USES:
-    source: community_id
-    target: entity_id
-
-  REFERENCES:
-    source: topic_id
-    target: entity_id
-
-  SIMILAR_TO:
-    source: message_id
-    target: message_id
-    metric: cosine_similarity
+(:Channel)-[:BELONGS_TO]->(:Community)
 ```
 
 ---
 
-# V1 → V2 progression
+## Phase 2 — Topic Modeling
+
+Extract latent topics from Portuguese Telegram messages.
+
+This phase assigns semantic topics to messages and summarizes topic dominance by community.
+
+### Input
+
+Use messages from V1 with community assignment from Phase 1.
 
 ```text
-V1
-Actors + Communication + Diffusion
-(User, Channel, Message)
-
-        ↓
-
-Communities
-
-        ↓
-
-Topics
-
-        ↓
-
-Entities
-
-        ↓
-
-Similarity
-
-        ↓
-
-Narratives / Propagation Analysis
+(Message)-[:IN_CHANNEL]->(Channel)-[:BELONGS_TO]->(Community)
 ```
 
-This keeps V2 as an **extension layer**, not a rewrite of V1.
+Required message fields:
+
+```yaml
+message_id
+text
+date
+month
+channel_id
+community_id
+is_forwarded
+is_reply
+views
+reactions
+forwards
+```
+
+### Unit of Analysis
+
+Primary unit:
+
+```text
+Message
+```
+
+Each message receives a topic assignment.
+
+Community-level topics are created later by aggregation.
+
+### Text Language
+
+Message content is in Portuguese.
+
+Use a multilingual embedding model:
+
+```text
+sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+```
+
+Reason:
+
+- supports Portuguese
+- fast enough for this dataset
+- good for short message similarity
+- produces compact embeddings
+
+Save embeddings after generation.
+
+```text
+message_id → embedding
+```
+
+Embeddings should not be recomputed unless preprocessing changes.
+
+### Topic Model
+
+Preferred method:
+
+```text
+BERTopic
+```
+
+### Preprocessing
+
+Apply light preprocessing only.
+
+Remove:
+
+- empty messages
+- very short messages
+- pure URLs
+- duplicated boilerplate
+- messages without textual content
+
+Keep:
+
+- hashtags
+- named entities
+- forwarded messages
+- reply messages
+- emojis if useful for later emotion analysis
+
+Minimum message length:
+
+```yaml
+min_words: 5
+```
+
+### Topic Assignment
+
+Each modeled message receives:
+
+```yaml
+topic_id
+topic_probability
+topic_rank
+```
+
+Graph relation:
+
+```text
+(Message)-[:BELONGS_TO_TOPIC]->(Topic)
+```
+
+Relation properties:
+
+```yaml
+probability
+rank
+```
+
+Topic `-1` is treated as noise or outlier.
+
+### Topic Labels
+
+Topic labels are generated from top topic keywords.
+
+Labels should be manually inspected.
+
+Example:
+
+```yaml
+topic_id: 12
+label: "eleições · fraude · urnas · governo"
+keywords:
+  - eleições
+  - fraude
+  - urnas
+  - governo
+```
+
+### Community Topic Aggregation
+
+After message-level topic assignment, aggregate topics by community.
+
+```text
+Community → Messages → Topics
+```
+
+Create dominance relation:
+
+```text
+(Community)-[:DOMINATED_BY]->(Topic)
+```
+
+Properties:
+
+```yaml
+share
+message_count
+```
+
+A topic is dominant when it represents a relevant share of messages in a community.
+
+### Output
+
+This phase produces:
+
+```yaml
+topic_id
+topic_label
+keywords
+message_count
+topic_embedding
+```
+
+Per-message output:
+
+```yaml
+message_id
+topic_id
+topic_probability
+topic_rank
+```
+
+Per-community output:
+
+```yaml
+community_id
+topic_id
+message_count
+topic_share
+```
+
+Graph additions prepared by this phase:
+
+```text
+(:Topic)
+
+(:Message)-[:BELONGS_TO_TOPIC]->(:Topic)
+
+(:Community)-[:DOMINATED_BY]->(:Topic)
+```
+
+---
+
+## Phase 3 — Message Similarity
+
+Create semantic similarity links between messages.
+
+This phase uses the same embeddings generated in Phase 2.
+
+### Input
+
+```yaml
+message_id
+text
+embedding
+topic_id
+community_id
+month
+```
+
+### Similarity Method
+
+Use cosine similarity between message embeddings.
+
+```text
+message_embedding → cosine similarity → similar messages
+```
+
+Preferred embedding source:
+
+```text
+sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+```
+
+Do not compare every message with every other message directly.
+
+Use approximate nearest neighbors.
+
+Suggested method:
+
+```text
+FAISS
+```
+
+### Filtering
+
+Create similarity links only when:
+
+```yaml
+cosine_similarity: >= 0.80
+top_k: 5
+```
+
+Optional filters:
+
+```yaml
+same_topic: true
+same_language: true
+exclude_same_message: true
+```
+
+### Output
+
+Graph relation:
+
+```text
+(Message)-[:SIMILAR_TO]->(Message)
+```
+
+Relation properties:
+
+```yaml
+cosine_similarity
+rank
+method
+embedding_model
+```
+
+---
+
+## Phase 4 — Emotion Analysis
+
+Analyze emotional tone in Portuguese Telegram messages.
+
+This phase adds emotion scores to messages and aggregates them by topic, community, and month.
+
+### Input
+
+```yaml
+message_id
+text
+topic_id
+community_id
+month
+is_forwarded
+is_reply
+```
+
+### Main Lexicon
+
+Use:
+
+```text
+NRC Emotion Lexicon
+```
+
+on: `Portuguese-NRC-EmoLex.txt`
+
+Emotion categories:
+
+```text
+anger
+fear
+sadness
+joy
+disgust
+trust
+anticipation
+surprise
+```
+
+Also keep polarity when available:
+
+```text
+positive
+negative
+```
+
+### Portuguese Handling
+
+Use the Portuguese version of NRC.
+
+Apply light normalization:
+
+```text
+lowercase
+remove extra spaces
+keep hashtags
+keep emojis
+lemmatize if useful
+```
+
+### Output
+
+Each message receives emotion scores.
+
+```yaml
+message_id
+anger_score
+fear_score
+sadness_score
+joy_score
+disgust_score
+trust_score
+anticipation_score
+surprise_score
+positive_score
+negative_score
+dominant_emotion
+```
+
+Graph additions prepared by this phase:
+
+Add emotion properties to messages:
+
+```text
+(:Message)
+```
+
+Properties:
+
+```yaml
+dominant_emotion
+anger_score
+fear_score
+sadness_score
+joy_score
+disgust_score
+trust_score
+anticipation_score
+surprise_score
+positive_score
+negative_score
+```
+
+## Phase 5 — Statistical Analysis
+
+Status: TO DO
+Later Implementation.
+
+Potential analyses:
+
+- Community-level topic differences
+- Community-level linguistic differences
+- Topic diffusion patterns
+- Forwarding behavior by topic
+- Entity usage differences across communities
+- Temporal narrative shifts
+- Community engagement comparisons
+
+Potential methods:
+
+```text
+t-test
+ANOVA
+Linear Mixed Models
+Poisson Models
+Negative Binomial Models
+Survival Analysis
+Time Series Analysis
+```
+
+---
+
+# Final V2 Topology
+
+```text
+(Channel) ─BELONGS_TO─▶ (Community)
+                              │
+                              ▼
+                         DOMINATED_BY
+                              │
+                              ▼
+                           (Topic)
+
+(Message) ─BELONGS_TO_TOPIC─▶ (Topic)
+
+(Message) ─SIMILAR_TO─▶ (Message)
+```

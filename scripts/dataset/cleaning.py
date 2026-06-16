@@ -5,6 +5,7 @@ Recover and normalize Aletheia data.
 """
 
 import csv
+import re
 import sys
 from io import StringIO
 from pathlib import Path
@@ -63,6 +64,7 @@ PORTUGUESE_COLUMNS = [
     "user_id",
     "channel_id",
     "text_content",
+    "text_clean",
     "date_parsed",
     "time_bin",
     "reply_to",
@@ -87,6 +89,27 @@ NUMERIC_COLUMNS = [
 
 CHANNEL_PATTERN = r"^<CHANNEL_HASH:[a-f0-9]+>$"
 MESSAGE_PATTERN = r"^<CHANNEL_HASH:[a-f0-9]+>_[0-9]+$"
+
+# Patterns used to derive the analysis-ready `text_clean` column. The raw
+# `text_content` is kept faithful (inline channel mentions and URLs are
+# semantically relevant for mention/domain analysis and are preserved there);
+# `text_clean` strips this noise so it never reaches TF-IDF, embeddings, or the
+# emotion lexicon downstream.
+# URLs are stripped first so an inline <CHANNEL_HASH:..> standing in for the
+# domain (e.g. https://<CHANNEL_HASH:..>.org/path) is consumed as part of the
+# URL rather than being split into orphaned scheme + path debris. `\s*//` also
+# tolerates source corruption like "http: //".
+URL_RE = re.compile(r"https?:\s*//\S+|www\.\S+", re.IGNORECASE)
+SCHEME_DEBRIS_RE = re.compile(r"https?:\s*/*", re.IGNORECASE)        # orphaned scheme leftovers
+HASH_PLACEHOLDER_RE = re.compile(r"<\w+_HASH:\w+>", re.IGNORECASE)   # <CHANNEL_HASH:..>, <USER_HASH:..>
+EMAIL_PLACEHOLDER_RE = re.compile(r"<\w+>")                          # <EMAIL>, <PHONE>, ...
+# After valid <PLACEHOLDER> tags are removed, any token still glued to a '<' or
+# '>' is mojibake debris (e.g. "<ç<÷B<÷<úR<î<óI") that would otherwise leak
+# fragment tokens like "úr"/"ói" into TF-IDF. Drop the whole offending token.
+ANGLE_DEBRIS_RE = re.compile(r"\S*[<>]\S*")
+HEX_RE = re.compile(r"\b[0-9a-f]{10,}\b", re.IGNORECASE)             # leftover hex from URL paths
+CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")             # binary corruption (keeps \t\n\r)
+MULTISPACE_RE = re.compile(r"\s+")
 
 Path(OUTPUT_PORTUGUESE).parent.mkdir(
     parents=True,
@@ -185,6 +208,75 @@ def clean_text_columns(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             logger.info(f"Repairing column: {col}")
             df[col] = df[col].apply(repair_text)
+
+    return df
+
+
+# ------------------------------------------------------------
+# Analysis text derivation
+# ------------------------------------------------------------
+
+def clean_analysis_text(value):
+    """
+    Derives analysis-ready text from a repaired message string.
+
+    Strips anonymisation placeholders (<CHANNEL_HASH:..>, <EMAIL>, ...), URLs,
+    leftover hex fragments, and binary control characters, then collapses
+    whitespace. The raw text_content is left untouched so structure that may be
+    semantically relevant (inline channel mentions, shared URLs) is preserved.
+
+    Args:
+        value:
+            Repaired text_content value.
+
+    Returns:
+        Cleaned text suitable for TF-IDF, embeddings, and the emotion lexicon.
+    """
+
+    # Empty/null text yields an empty analysis string
+    if pd.isna(value):
+        return ""
+
+    s = str(value)
+
+    # Remove full URLs first (consuming any inline hash that stands in for the
+    # domain), then standalone placeholders, then any orphaned scheme debris
+    s = URL_RE.sub(" ", s)
+    s = HASH_PLACEHOLDER_RE.sub(" ", s)
+    s = EMAIL_PLACEHOLDER_RE.sub(" ", s)
+    s = ANGLE_DEBRIS_RE.sub(" ", s)
+    s = SCHEME_DEBRIS_RE.sub(" ", s)
+    s = HEX_RE.sub(" ", s)
+
+    # Drop binary control characters left by decoding damage
+    s = CONTROL_RE.sub(" ", s)
+
+    # Collapse runs of whitespace produced by the substitutions
+    s = MULTISPACE_RE.sub(" ", s).strip()
+
+    return s
+
+
+def add_analysis_text(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds the derived text_clean column built from text_content.
+
+    Args:
+        df:
+            Dataframe with a repaired text_content column.
+
+    Returns:
+        Dataframe with an added text_clean column.
+    """
+
+    logger.info("Deriving analysis-ready text_clean column.")
+
+    # Derive the cleaned analysis text from the faithful text_content
+    df["text_clean"] = df["text_content"].apply(clean_analysis_text)
+
+    # Report how much noise the derivation removed for monitoring
+    emptied = ((df["text_content"].fillna("").str.len() > 0) & (df["text_clean"].str.len() == 0)).sum()
+    logger.info(f"Messages reduced to empty text_clean: {emptied}")
 
     return df
 
@@ -622,6 +714,9 @@ def main():
 
     # Normalize dates and numeric fields after null cleanup
     good = normalize_types(good)
+
+    # Derive the analysis-ready text_clean column (text_content stays faithful)
+    good = add_analysis_text(good)
 
     # Select only Portuguese rows and keep columns needed for the next phase
     selected = select_pt_messages(good)

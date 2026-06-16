@@ -359,9 +359,70 @@ Meaning:
 
 ---
 
-# Final V1 Overview
+## 6. Channel interaction graph
 
-## Topology
+Derived from three structural signals already present in V1. Used as the projected
+channel graph for community detection in later analysis steps.
+
+Does not replace the original relations — summarises them.
+
+```yaml
+(Channel)-[:INTERACTS_WITH]->(Channel)
+```
+
+Derived from:
+
+```text
+(User)-[:ACTIVE_IN]->(Channel)
+(Message)-[:IN_CHANNEL]->(Channel)
+(Message)-[:FORWARDED_FROM]->(Channel)
+(Message)-[:REPLIES_TO]->(Message)
+(Message)-[:REPLIED_INTO]->(Channel)
+```
+
+Construction logic:
+
+1. **Shared users** — same user active in both channels:
+
+```text
+User active in Channel A AND Channel B
+→ A -[:INTERACTS_WITH]-> B
+→ B -[:INTERACTS_WITH]-> A   (both directions)
+```
+
+2. **Forwarding** — message in target channel forwarded from source channel:
+
+```text
+Message in Channel B, FORWARDED_FROM Channel A
+→ A -[:INTERACTS_WITH]-> B
+```
+
+3. **Replies** — message in target channel replies to message from source channel:
+
+```text
+Message in Channel B replies to Message in Channel A  (via reply_to_channel)
+→ A -[:INTERACTS_WITH]-> B
+```
+
+Properties:
+
+```yaml
+shared_users_count: int
+forward_count: int
+reply_count: int
+interaction_count: int        # shared_users_count + forward_count + reply_count
+interaction_weight: float     # same formula; typed float for graph algorithms
+
+has_shared_user_signal: bool
+has_forward_signal: bool
+has_reply_signal: bool
+```
+
+Self-loops (A → A) are excluded.
+
+---
+
+# Final V1 Topology
 
 ```text
 (User)
@@ -391,6 +452,13 @@ ACTIVE_IN
 (Message)
     |
 FORWARDED_FROM
+    |
+    v
+(Channel)
+
+(Channel)
+    |
+INTERACTS_WITH   ← derived: shared users + forwards + replies
     |
     v
 (Channel)

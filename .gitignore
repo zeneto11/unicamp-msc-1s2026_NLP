@@ -41,5 +41,5 @@ dist/
 # Data
 data/
 figures/
-reports/
+# reports/
 import/
