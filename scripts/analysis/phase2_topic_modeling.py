@@ -3,8 +3,18 @@
 Extract latent topics from Portuguese messages, assign each modeled message a
 topic, and summarise topic dominance per community.
 
+Pipeline (all parameters in scripts.analysis.config):
+    1. Preprocess the canonical ``text_clean`` column (drop empty / too-short /
+       duplicate messages) and filter non-target-language contamination.
+    2. Embed with a multilingual sentence transformer (L2-normalized for cosine).
+    3. Fit BERTopic with a token-filtered c-TF-IDF vectorizer (letters-only +
+       Portuguese stopwords) so digit/mojibake fragments never become labels,
+       and ``min_topic_size`` set above the default to avoid over-fragmentation.
+    4. Reassign HDBSCAN outliers to their nearest topic above a cosine floor,
+       turning the ~48% default noise bucket into a small residual.
+
 Inputs:
-    data/aletheia_clean_pt.csv                       (message text + metadata)
+    data/aletheia_clean_pt.csv                       (text_clean + metadata)
     neo4j/import/aletheia_pt_v2/channel_community.csv (Phase 1 assignment)
 
 Outputs (neo4j/import/aletheia_pt_v2/):
@@ -15,8 +25,9 @@ Outputs (neo4j/import/aletheia_pt_v2/):
     message_topics.csv              message_id, topic_id, probability, rank
     community_topics.csv            community_id, topic_id, message_count, share
 
-Heavy dependencies are imported lazily: sentence-transformers (embeddings) and
-BERTopic (topic model). Embeddings are normalized so Phase 3 can use cosine.
+Heavy dependencies are imported lazily: sentence-transformers (embeddings),
+BERTopic (topic model), and langdetect (language filter — skipped with a warning
+if absent). Install with: pip install sentence-transformers bertopic langdetect.
 """
 import numpy as np
 import pandas as pd
@@ -24,11 +35,53 @@ from loguru import logger
 
 from scripts.analysis.config import CONFIG
 from scripts.analysis.io_utils import write_artifact, list_to_pipe
+from scripts.analysis.text_features import PT_STOPWORDS, KEYWORD_TOKEN_PATTERN
 from scripts.utils.logger import setup_logger
 
 
 setup_logger(__file__)
 
+
+def _filter_language(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Drop messages whose detected language is not the configured target.
+
+    The upstream `language` column mislabels some messages (e.g. Italian tagged
+    Portuguese), which surface as spurious non-PT topics. langdetect is imported
+    lazily and the step degrades to a no-op (with a warning) if it is missing,
+    keeping the module importable without the dependency.
+
+    Args:
+        df: Preprocessed messages with a `text` column.
+
+    Returns:
+        DataFrame containing only target-language messages.
+    """
+    if not CONFIG.language_filter:
+        return df
+    try:
+        from langdetect import detect, DetectorFactory
+    except ImportError:
+        logger.warning("langdetect not installed; skipping language filter.")
+        return df
+
+    # Deterministic detection across runs.
+    DetectorFactory.seed = CONFIG.random_seed
+
+    def _is_target(text: str) -> bool:
+        try:
+            return detect(text) == CONFIG.keep_language
+        except Exception:
+            # Keep messages langdetect cannot classify (very short / symbolic)
+            # rather than silently dropping them.
+            return True
+
+    before = len(df)
+    df = df[df["text"].map(_is_target)]
+    logger.info(
+        f"Language filter kept {len(df)}/{before} '{CONFIG.keep_language}' messages."
+    )
+    return df
 
 
 def preprocess_messages() -> pd.DataFrame:
@@ -69,6 +122,10 @@ def preprocess_messages() -> pd.DataFrame:
 
     # Drop duplicated boilerplate, keeping the first occurrence.
     df = df.drop_duplicates(subset=["text"], keep="first")
+
+    # Drop non-target-language contamination after length/dedup filtering so
+    # langdetect runs on the smaller, substantive set.
+    df = _filter_language(df)
 
     logger.info(f"Preprocessing kept {len(df)}/{before} messages for modeling.")
     return df[["message_id", "channel_id", "text"]].reset_index(drop=True)
@@ -113,15 +170,47 @@ def run_topic_model(texts: list[str], embeddings: np.ndarray):
         Tuple of (fitted BERTopic model, topic ids per message, probabilities).
     """
     from bertopic import BERTopic
+    from sklearn.feature_extraction.text import CountVectorizer
+
+    # Token-filtered c-TF-IDF: applies the same letters-only filter as the Phase 1
+    # keywords so digit-glued / mojibake fragments never become topic labels, and
+    # drops Portuguese stopwords from the representations.
+    vectorizer_model = CountVectorizer(
+        token_pattern=KEYWORD_TOKEN_PATTERN,
+        stop_words=PT_STOPWORDS,
+    )
 
     logger.info("Fitting BERTopic model.")
     topic_model = BERTopic(
         embedding_model=CONFIG.embedding_model,
+        vectorizer_model=vectorizer_model,
+        min_topic_size=CONFIG.min_topic_size,
         calculate_probabilities=True,
         verbose=True,
     )
     topics, probs = topic_model.fit_transform(texts, embeddings=embeddings)
     logger.info(f"BERTopic produced {len(set(topics))} topics (incl. noise).")
+
+    # Reassign outliers (-1) to their nearest topic by embedding proximity, then
+    # refresh topic representations so labels reflect the reassigned documents.
+    if CONFIG.reduce_outliers:
+        n_noise = sum(1 for t in topics if t == CONFIG.noise_topic_id)
+        topics = topic_model.reduce_outliers(
+            texts,
+            topics,
+            strategy=CONFIG.outlier_reduction_strategy,
+            embeddings=embeddings,
+            threshold=CONFIG.outlier_reduction_threshold,
+        )
+        topic_model.update_topics(
+            texts, topics=topics, vectorizer_model=vectorizer_model
+        )
+        n_noise_after = sum(1 for t in topics if t == CONFIG.noise_topic_id)
+        logger.info(
+            f"Outlier reduction ({CONFIG.outlier_reduction_strategy}): "
+            f"noise {n_noise} -> {n_noise_after}."
+        )
+
     return topic_model, topics, probs
 
 
@@ -186,17 +275,24 @@ def build_message_topics(
         DataFrame with message_id, topic_id, probability, rank.
     """
     probs = np.asarray(probs)
+    topic_ids = [int(t) for t in topics]
 
-    # Probability of the assigned primary topic; rank is 1 for the primary topic.
+    # Probability of the *assigned* topic. After outlier reduction the assigned
+    # topic can differ from the soft-cluster argmax, so index the probability
+    # matrix by the final topic id (0 for any message still in the noise bucket).
     if probs.ndim == 2:
-        probability = probs.max(axis=1)
+        n_cols = probs.shape[1]
+        probability = np.array([
+            probs[i, t] if 0 <= t < n_cols else 0.0
+            for i, t in enumerate(topic_ids)
+        ])
     else:
         probability = probs
 
     out = pd.DataFrame(
         {
             "message_id": message_ids.values,
-            "topic_id": [int(t) for t in topics],
+            "topic_id": topic_ids,
             "probability": np.round(np.nan_to_num(probability, nan=0.0), 6),
             "rank": 1,
         }

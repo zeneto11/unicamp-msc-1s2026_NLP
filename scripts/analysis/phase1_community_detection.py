@@ -22,29 +22,11 @@ from loguru import logger
 
 from scripts.analysis.config import CONFIG
 from scripts.analysis.io_utils import write_artifact, list_to_pipe
+from scripts.analysis.text_features import PT_STOPWORDS, KEYWORD_TOKEN_PATTERN
 from scripts.utils.logger import setup_logger
 
 
 setup_logger(__file__)
-
-# A compact Portuguese stopword list for descriptive keyword extraction. Noise
-# from hashes/URLs is already stripped upstream in the canonical text_clean
-# column (scripts/dataset/cleaning.py); these are genuine high-frequency words.
-PT_STOPWORDS = [
-    "a", "o", "e", "é", "de", "do", "da", "dos", "das", "em", "no", "na",
-    "nos", "nas", "um", "uma", "uns", "umas", "para", "por", "com", "sem",
-    "que", "se", "as", "os", "ao", "aos", "à", "às", "mais", "mas", "como",
-    "ou", "já", "não", "sim", "também", "muito", "muita", "ser", "está",
-    "este", "esta", "isso", "isto", "esse", "essa", "the", "to",
-    "br", "me", "eu", "você", "ele", "ela", "nós",
-    "eles", "elas", "foi", "são", "tem", "vai", "está", "pra", "pro", "lá",
-    "aqui", "todo", "toda", "todos", "todas", "seu", "sua", "seus", "suas",
-]
-
-# Keep only alphabetic tokens (incl. Portuguese accents), 2+ chars. This drops
-# pure-digit and digit-prefixed fragments (e.g. binary-corruption remnants like
-# "5m5") that survive as tokens but carry no descriptive value.
-KEYWORD_TOKEN_PATTERN = r"(?u)\b[^\W\d_][^\W\d_]+\b"
 
 
 def load_interaction_edges() -> pd.DataFrame:

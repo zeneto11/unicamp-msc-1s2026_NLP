@@ -73,6 +73,24 @@ class AnalysisConfig:
     topic_dominance_min_share: float = 0.05
     # BERTopic noise/outlier topic id.
     noise_topic_id: int = -1
+    # HDBSCAN min cluster size (BERTopic min_topic_size). Larger -> fewer, denser
+    # topics; the default of 10 over-fragments and inflates the noise bucket.
+    min_topic_size: int = 15
+    # Reassign noise (-1) messages to their nearest topic by embedding proximity,
+    # then refresh topic representations. Fixes the ~48% outlier rate that is a
+    # known artifact of default HDBSCAN on short social text.
+    reduce_outliers: bool = True
+    outlier_reduction_strategy: str = "embeddings"
+    # Minimum embedding cosine to a topic for an outlier to be reassigned. Above
+    # 0 keeps genuinely un-clusterable messages in the noise bucket instead of
+    # forcing every message into a topic (which would yield mostly low-confidence
+    # assignments).
+    outlier_reduction_threshold: float = 0.50
+    # Drop non-target-language messages before modeling (catches contamination
+    # the upstream `language` column mislabels). Requires langdetect; skipped with
+    # a warning if it is not installed.
+    language_filter: bool = True
+    keep_language: str = "pt"
 
     # ----- Phase 3: message similarity -----
     similarity_threshold: float = 0.80

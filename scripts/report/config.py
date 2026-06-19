@@ -52,6 +52,13 @@ class ReportConfig:
     top_topics: int = 12
     top_emotion_communities: int = 8
 
+    # Topic distinctiveness (lift = community topic share / corpus topic share):
+    # a topic is "characteristic" of a community when it has at least this many
+    # messages there and is over-represented by at least this factor.
+    lift_min_support: int = 15
+    lift_min_lift: float = 1.5
+    distinctive_per_community: int = 2
+
     # Matplotlib defaults applied once at startup.
     fig_dpi: int = 150
     fig_size: tuple[int, int] = (10, 6)

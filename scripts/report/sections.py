@@ -71,6 +71,101 @@ def _pct(x) -> str:
     return f"{100 * float(x):.1f}%"
 
 
+def _dimensions_plot(dims: dict, title: str, filename: str) -> str:
+    """
+    Plot entity (node) and relation (edge) cardinalities of a graph version.
+
+    Nodes and edges are coloured differently and drawn on a log scale so counts
+    spanning orders of magnitude (hundreds → tens of thousands) stay readable.
+
+    Args:
+        dims: Mapping with ``nodes`` and ``edges`` dicts of label -> count.
+        title: Plot title.
+        filename: Output figure file name.
+
+    Returns:
+        Output figure file name.
+    """
+    node_color, edge_color = "#2e7d32", "#3b6ea5"
+    labels, values, colors = [], [], []
+    for label, count in dims["nodes"].items():
+        labels.append(f"{label} (node)")
+        values.append(count)
+        colors.append(node_color)
+    for label, count in dims["edges"].items():
+        labels.append(f"{label} (edge)")
+        values.append(count)
+        colors.append(edge_color)
+
+    # Largest at the top of the horizontal bar chart.
+    series = pd.Series(values, index=labels).sort_values()
+    colors = [colors[labels.index(i)] for i in series.index]
+    return viz.bar(
+        series, title, "count (log scale)", "", filename,
+        color=colors, log=True,
+    )
+
+
+# ----------------------------------------------------------------------------
+# Topic distinctiveness + size-normalized diversity
+# ----------------------------------------------------------------------------
+def _topic_distinctiveness(modeled: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """
+    Compute per-community topic lift and size-normalized topic diversity.
+
+    ``lift(c, t) = (share of topic t within community c) / (share of t in the
+    modeled corpus)`` identifies topics a community is built around, as opposed
+    to the raw mode (which is just the globally largest topic almost everywhere).
+
+    Distinct-topic *counts* grow mechanically with message volume (a rarefaction
+    artifact), so diversity is also reported size-normalized: topics per 1k
+    messages, Shannon entropy, and Pielou evenness.
+
+    Args:
+        modeled: Per-message frame restricted to non-noise topic assignments,
+            carrying community_id and topic_id.
+
+    Returns:
+        Tuple of (diversity DataFrame indexed by community_id, distinctive-topics
+        dict mapping community_id -> list of (topic_id, lift, message_count)).
+    """
+    m = modeled.dropna(subset=["community_id", "topic_id"]).copy()
+    m["community_id"] = m["community_id"].astype(int)
+    m["topic_id"] = m["topic_id"].astype(int)
+
+    corpus_share = m["topic_id"].value_counts(normalize=True)
+
+    rows, distinctive = [], {}
+    for c, sub in m.groupby("community_id"):
+        n = len(sub)
+        counts = sub["topic_id"].value_counts()
+        p = counts / n
+
+        # Shannon entropy + Pielou evenness over this community's topic mix.
+        ent = float(-(p * np.log(p)).sum())
+        k = int((counts > 0).sum())
+        evenness = float(ent / np.log(k)) if k > 1 else 0.0
+        rows.append({
+            "community_id": c,
+            "distinct_topics": k,
+            "topics_per_1k": round(k / n * 1000, 2),
+            "topic_entropy": round(ent, 4),
+            "topic_evenness": round(evenness, 4),
+        })
+
+        # Distinctive topics: over-represented vs corpus, with minimum support.
+        supported = counts[counts >= CONFIG.lift_min_support].index
+        lift = (p / corpus_share.reindex(p.index)).loc[p.index.isin(supported)]
+        lift = lift[lift >= CONFIG.lift_min_lift].sort_values(ascending=False)
+        distinctive[c] = [
+            (int(t), float(l), int(counts[t]))
+            for t, l in lift.head(CONFIG.distinctive_per_community).items()
+        ]
+
+    div = pd.DataFrame(rows).set_index("community_id")
+    return div, distinctive
+
+
 # ----------------------------------------------------------------------------
 # Shared context
 # ----------------------------------------------------------------------------
@@ -117,10 +212,19 @@ def build_context(data: ReportData) -> dict:
     active["community_id"] = active["channel_id"].map(ch_to_comm)
     comm_users = active.groupby("community_id")["user_id"].nunique().rename("users")
 
-    # Topic diversity: distinct non-noise topics observed in a community.
+    # Topic diversity + distinctiveness. Raw distinct-topic counts are kept for
+    # continuity, but size-normalized diversity (entropy/evenness/per-1k) and
+    # per-community lift are the load-bearing metrics downstream.
     modeled = msg[msg["topic_id"].notna() & (msg["topic_id"] != CONFIG.noise_topic_id)]
-    comm_topic_div = (
-        modeled.groupby("community_id")["topic_id"].nunique().rename("topic_diversity")
+    diversity, distinctive = _topic_distinctiveness(modeled)
+    comm_topic_div = diversity["distinct_topics"].rename("topic_diversity")
+
+    # Per-community noise rate: among messages that reached the topic model, the
+    # share left in the outlier bucket. Surfaces uneven topic coverage.
+    assigned = msg[msg["topic_id"].notna()]
+    comm_noise = (
+        assigned.assign(is_noise=assigned["topic_id"] == CONFIG.noise_topic_id)
+        .groupby("community_id")["is_noise"].mean().rename("noise_rate")
     )
 
     # Mean polarity scores per community.
@@ -153,10 +257,17 @@ def build_context(data: ReportData) -> dict:
     profile = profile.rename(columns={"size": "channels"})
     profile = profile.join([comm_dataset_ch, comm_msgs, comm_users,
                             comm_topic_div, comm_sim])
+    # Size-normalized diversity metrics (entropy, evenness, topics per 1k).
+    profile = profile.join(diversity[["topics_per_1k", "topic_entropy", "topic_evenness"]])
+    profile = profile.join(comm_noise)
     profile = profile.join(comm_pol)
     profile["dominant_emotion"] = comm_dom
     profile["net_polarity"] = profile["positive_score"] - profile["negative_score"]
-    profile = profile.fillna({"topic_diversity": 0, "avg_similarity": 0})
+    profile = profile.fillna({
+        "topic_diversity": 0, "avg_similarity": 0,
+        "topics_per_1k": 0, "topic_entropy": 0, "topic_evenness": 0,
+        "noise_rate": 0,
+    })
     profile.index.name = "community_id"
 
     # --- Inter-community links (cross-community INTERACTS_WITH weight). ---
@@ -176,6 +287,42 @@ def build_context(data: ReportData) -> dict:
         .sort_values("interaction_weight", ascending=False)
     )
 
+    # --- V1 / V2 graph dimensions (entity and relation cardinalities). ---
+    def _rows(path) -> int:
+        """Count CSV rows cheaply (single column), 0 if the file is absent."""
+        return len(pd.read_csv(path, usecols=[0])) if path.exists() else 0
+
+    v1 = CONFIG.v1_dir
+    n_topics = int((data.topics["id"] != CONFIG.noise_topic_id).sum())
+    v1_dims = {
+        "nodes": {
+            "Channel": len(data.channels),
+            "User": int(data.users["id"].nunique()),
+            "Message": len(msg),
+        },
+        "edges": {
+            "POSTED": _rows(v1 / "posted.csv"),
+            "IN_CHANNEL": len(data.in_channel),
+            "ACTIVE_IN": len(data.active_in),
+            "REPLIES_TO": _rows(v1 / "replies_to.csv"),
+            "FORWARDED_FROM": _rows(v1 / "forwarded_from.csv"),
+            "REPLIED_INTO": _rows(v1 / "replied_into.csv"),
+            "INTERACTS_WITH": len(data.interacts_with),
+        },
+    }
+    v2_dims = {
+        "nodes": {
+            "Community": len(data.communities),
+            "Topic": n_topics,
+        },
+        "edges": {
+            "BELONGS_TO": len(data.channel_community),
+            "BELONGS_TO_TOPIC": len(data.message_topics),
+            "DOMINATED_BY": len(data.community_topics),
+            "SIMILAR_TO": len(data.similarity),
+        },
+    }
+
     return {
         "graph": graph,
         "msg_to_channel": msg_to_channel,
@@ -184,6 +331,9 @@ def build_context(data: ReportData) -> dict:
         "inter_links": inter_links,
         "sim": sim,                       # similarity with community columns attached
         "modeled": modeled,
+        "distinctive": distinctive,       # community_id -> [(topic_id, lift, count)]
+        "v1_dims": v1_dims,
+        "v2_dims": v2_dims,
     }
 
 
@@ -219,30 +369,39 @@ def section_01_summary(data: ReportData, ctx: dict) -> str:
     biggest = profile.sort_values("messages", ascending=False).iloc[0]
     biggest_kw = str(biggest["community_name"]).split(" · ")[:3]
 
+    n_dataset = int((data.channels["is_dataset_channel"] == True).sum())  # noqa: E712
+    neutral_share = float((data.msg["dominant_emotion"] == "neutral").mean())
+
     return "\n".join([
         "## 1. Executive Summary",
         "",
-        f"- **Structure (V1).** {len(data.channels)} channels ({int((data.channels['is_dataset_channel']==True).sum())} core + external sources) "  # noqa: E712
-        f"and {data.users['id'].nunique():,} users are linked through {data.interacts_with.shape[0]:,} "
-        "channel-interaction edges (shared users, forwards, replies).",
-        f"- **Communities (V2 / Phase 1).** Leiden finds **{n_comm} communities** "
-        f"over {int(profile['channels'].sum())} channels at modularity **{modularity:.2f}** "
-        "— a clear, well-separated structure.",
-        f"- **Topics (V2 / Phase 2).** **{n_topics} topics** extracted from "
-        f"{len(data.message_topics):,} modeled messages; "
-        f"{_pct(noise_share)} fall in the BERTopic noise bucket (`-1`).",
-        f"- **Semantics (V2 / Phase 3).** **{n_sim:,} near-duplicate message pairs** "
-        f"(cosine ≥ {CONFIG.similarity_threshold:.2f}); {_pct(inter_share)} of them link "
-        "*different* communities — measurable cross-group narrative reuse.",
-        f"- **Emotion (V2 / Phase 4).** Dominant tone is **{', '.join(top_emos)}**; "
-        f"{_pct((data.msg['dominant_emotion']=='neutral').mean())} of messages carry no "
-        "lexicon emotion (neutral).",
-        f"- **Most active community:** `C{int(biggest.name)}` "
-        f"({int(biggest['messages']):,} messages) — {' · '.join(biggest_kw)}.",
+        "- **Structure (V1).**",
+        f"  - {len(data.channels)} channels ({n_dataset} core + external sources) and "
+        f"{data.users['id'].nunique():,} users.",
+        f"  - {data.interacts_with.shape[0]:,} channel-interaction edges (shared users, "
+        "forwards, replies).",
+        "- **Communities (V2 / Phase 1).**",
+        f"  - Leiden finds **{n_comm} communities** over {int(profile['channels'].sum())} channels.",
+        f"  - Modularity **{modularity:.2f}** — a clear, well-separated structure.",
+        "- **Topics (V2 / Phase 2).**",
+        f"  - **{n_topics} topics** from {len(data.message_topics):,} modeled messages.",
+        f"  - {_pct(noise_share)} residual noise after outlier reassignment (down from ~48% "
+        "default); each community has *characteristic* topics revealed by lift.",
+        "- **Semantics (V2 / Phase 3).**",
+        f"  - **{n_sim:,} near-duplicate message pairs** (cosine ≥ {CONFIG.similarity_threshold:.2f}).",
+        f"  - {_pct(inter_share)} of them link *different* communities — measurable "
+        "cross-group narrative reuse.",
+        "- **Emotion (V2 / Phase 4).**",
+        f"  - Dominant tone is **{', '.join(top_emos)}**.",
+        f"  - {_pct(neutral_share)} of messages carry no lexicon emotion (neutral).",
+        "- **Most active community.**",
+        f"  - `C{int(biggest.name)}` with {int(biggest['messages']):,} messages — "
+        f"{' · '.join(biggest_kw)}.",
         "",
-        "> The graph is highly centralized: a few large channels and one or two "
-        "communities carry most messages, topics repeat across communities, and "
-        "negatively-valenced emotions (anger, fear) lead the corpus.",
+        "> The graph is highly centralized: a few large channels and communities carry most "
+        "messages. Communities have distinct thematic identities (anti-vaccine, "
+        "alternative-medicine, geopolitical, religious-extremist) yet cross-post shared "
+        "templates; tone is neutral-heavy with anger/fear leading among emotional messages.",
         "",
     ])
 
@@ -376,11 +535,44 @@ def section_03_v1_structure(data: ReportData, ctx: dict) -> str:
         columns=["Metric", "Value"],
     )
 
+    # V1 entity / relation cardinalities + figure.
+    dims = ctx["v1_dims"]
+    dims_tbl = pd.DataFrame(
+        [["Channel", "node", dims["nodes"]["Channel"], "actors — Telegram channels"],
+         ["User", "node", dims["nodes"]["User"], "actors — message authors"],
+         ["Message", "node", dims["nodes"]["Message"], "individual posts"],
+         ["POSTED", "edge", dims["edges"]["POSTED"], "User → Message"],
+         ["IN_CHANNEL", "edge", dims["edges"]["IN_CHANNEL"], "Message → Channel"],
+         ["ACTIVE_IN", "edge", dims["edges"]["ACTIVE_IN"], "User → Channel (aggregated)"],
+         ["REPLIES_TO", "edge", dims["edges"]["REPLIES_TO"], "Message → Message"],
+         ["FORWARDED_FROM", "edge", dims["edges"]["FORWARDED_FROM"], "Message → source Channel"],
+         ["REPLIED_INTO", "edge", dims["edges"]["REPLIED_INTO"], "Message → replied Channel"],
+         ["INTERACTS_WITH", "edge", dims["edges"]["INTERACTS_WITH"], "Channel ↔ Channel (derived)"]],
+        columns=["Element", "Type", "Count", "Meaning"],
+    )
+    fig_dims = _dimensions_plot(dims, "Graph V1 — entities and relations", "v1_graph_dimensions.png")
+
     return "\n".join([
         "## 3. Graph Version 1 — Basic Structural Analysis",
         "",
-        "V1 analysis runs on the derived `INTERACTS_WITH` channel graph, which "
-        "summarizes shared users, forwards, and replies into weighted channel-to-channel edges.",
+        "V1 is the structural layer: three entity types (Channel, User, Message) connected "
+        "by authorship, membership, reply, and forwarding relations. From these, a derived "
+        "`INTERACTS_WITH` edge projects the network onto a weighted channel-to-channel graph.",
+        "",
+        "### Entities and relations",
+        "",
+        viz.md_table(dims_tbl, max_rows=12, floatfmt=".0f"),
+        "",
+        viz.md_image(fig_dims, "Graph V1 entities and relations"),
+        "",
+        "_The graph is message-centric: `POSTED` and `IN_CHANNEL` scale with the 32k "
+        "messages, while reply/forward edges are far sparser — most posts are standalone._",
+        "",
+        "### Channel interaction graph",
+        "",
+        "The remaining structural analysis runs on the `INTERACTS_WITH` projection, which "
+        "summarizes shared users, forwards, and replies into weighted channel edges — the "
+        "same graph community detection consumes in Phase 1.",
         "",
         viz.md_table(stats, floatfmt=".4f"),
         "",
@@ -417,49 +609,33 @@ def section_04_v2_expanded(data: ReportData, ctx: dict) -> str:
     Returns:
         Markdown for the V2 expansion section.
     """
-    msg = data.msg
-    n_topics = int((data.topics["id"] != CONFIG.noise_topic_id).sum())
-
-    layers = pd.DataFrame(
-        [
-            ["Phase 1", "Community", "BELONGS_TO (channel→community)",
-             f"{len(data.communities)} communities / {len(data.channel_community)} memberships"],
-            ["Phase 2", "Topic", "BELONGS_TO_TOPIC, DOMINATED_BY",
-             f"{n_topics} topics / {len(data.message_topics):,} assignments"],
-            ["Phase 3", "—", "SIMILAR_TO (message→message)",
-             f"{len(data.similarity):,} edges (cosine ≥ {CONFIG.similarity_threshold:.2f})"],
-            ["Phase 4", "—", "emotion scores on Message",
-             f"{len(data.emotions):,} messages labelled"],
-        ],
-        columns=["Phase", "New node", "New edges / attributes", "Volume"],
+    fig_dims = _dimensions_plot(
+        ctx["v2_dims"], "Graph V2 — added entities and relations", "v2_graph_dimensions.png"
     )
-
-    start, end = msg["date_parsed"].min(), msg["date_parsed"].max()
 
     return "\n".join([
         "## 4. Graph Version 2 — Expanded Structural and Semantic Analysis",
         "",
-        "V2 keeps every V1 node and edge and adds four enrichment layers, each derived "
-        "from V1 by one analysis phase:",
+        "V2 keeps every V1 node and edge untouched and adds two new entity types "
+        "(Community, Topic) plus semantic relations and per-message emotion scores. The "
+        "plot below mirrors Section 3, showing only what each analysis phase *adds*:",
         "",
-        viz.md_table(layers, floatfmt=".0f"),
+        viz.md_image(fig_dims, "Graph V2 added entities and relations"),
         "",
-        "**How the phases enrich the graph**",
+        f"_Enrichment is dominated by `BELONGS_TO_TOPIC` ({len(data.message_topics):,}) and "
+        f"`SIMILAR_TO` ({len(data.similarity):,}) — message-level edges — while the new "
+        "Community/Topic nodes are comparatively few but anchor the whole semantic layer._",
         "",
-        "1. *Community detection* partitions the channel interaction graph into "
-        "structural groups (Phase 1).",
-        "2. *Topic modeling* (BERTopic over multilingual embeddings) assigns each modeled "
-        "message a latent topic and rolls topics up to community dominance (Phase 2).",
-        "3. *Message similarity* turns the same embeddings into semantic `SIMILAR_TO` "
-        "edges, exposing near-duplicate / reused content (Phase 3).",
-        "4. *Emotion scoring* (Portuguese NRC lexicon) attaches eight emotion scores plus "
-        "polarity and a dominant emotion to every message (Phase 4).",
+        "**What each phase adds**",
         "",
-        "**V2 coverage**",
-        "",
-        f"- Communities: {len(data.communities)} · Topics: {n_topics} (+1 noise bucket)",
-        f"- Similarity edges: {len(data.similarity):,} · Emotion-labelled messages: {len(data.emotions):,}",
-        f"- Temporal span carried from V1: {start:%Y-%m} → {end:%Y-%m}",
+        "1. *Community detection* — partitions the channel interaction graph into structural "
+        "groups (Phase 1).",
+        "2. *Topic modeling* — BERTopic over multilingual embeddings assigns each modeled "
+        "message a topic and rolls topics up to community dominance (Phase 2).",
+        "3. *Message similarity* — the same embeddings become `SIMILAR_TO` edges, exposing "
+        "near-duplicate / reused content (Phase 3).",
+        "4. *Emotion scoring* — the Portuguese NRC lexicon attaches eight emotion scores, "
+        "polarity, and a dominant emotion to every message (Phase 4).",
         "",
     ])
 
@@ -489,6 +665,16 @@ def section_05_communities(data: ReportData, ctx: dict) -> str:
         "community_sizes.png",
     )
 
+    # Messages per community — exposes the volume imbalance behind the structure.
+    msg_series = (
+        profile["messages"].fillna(0).sort_values(ascending=True)
+    )
+    msg_series.index = [f"C{int(i)}" for i in msg_series.index]
+    fig_msgs = viz.bar(
+        msg_series, "Messages per community", "messages", "community",
+        "community_messages.png", color="#a5673b",
+    )
+
     summary_stats = pd.DataFrame(
         [
             ["Communities", f"{len(profile)}"],
@@ -501,8 +687,8 @@ def section_05_communities(data: ReportData, ctx: dict) -> str:
         columns=["Metric", "Value"],
     )
 
-    # Top communities table.
-    top = profile.sort_values("messages", ascending=False).head(CONFIG.top_communities)
+    # All communities by message volume.
+    top = profile.sort_values("messages", ascending=False)
     top_tbl = pd.DataFrame({
         "community": [f"C{int(i)}" for i in top.index],
         "channels": top["channels"].astype(int).values,
@@ -538,9 +724,14 @@ def section_05_communities(data: ReportData, ctx: dict) -> str:
         "_Community sizes are strongly imbalanced — a few large communities dominate the "
         "structure while several are small satellites._",
         "",
-        "### Top communities (by message volume)",
+        viz.md_image(fig_msgs, "Messages per community"),
         "",
-        viz.md_table(top_tbl, max_rows=CONFIG.top_communities, floatfmt=".3f"),
+        "_Volume is even more skewed than channel count: the ranking by messages differs "
+        "from the ranking by channels, so structural size does not equal activity._",
+        "",
+        "### Communities by message volume",
+        "",
+        viz.md_table(top_tbl, max_rows=20, floatfmt=".3f"),
         "",
         "_Message and user counts come only from the core channels; size (channels) "
         "additionally includes external forward/reply sources clustered with them._",
@@ -595,7 +786,12 @@ def section_06_topics(data: ReportData, ctx: dict) -> str:
         "topic_top_counts.png",
     )
 
-    # Dominant topics per community.
+    label_of = dict(zip(topics["id"], topics["label"]))
+    profile = ctx["profile"]
+
+    # Most common (mode) topic per community + its plurality share. The mode is
+    # usually just the globally largest topic, so its share is reported to show
+    # how weak "dominance" actually is.
     ct = data.community_topics.merge(
         topics[["id", "label"]], left_on="topic_id", right_on="id", how="left"
     )
@@ -603,26 +799,61 @@ def section_06_topics(data: ReportData, ctx: dict) -> str:
     dom_top = (
         dom.groupby("community_id").head(1)
         .sort_values("message_count", ascending=False)
-        .head(CONFIG.top_communities)
     )
-    dom_tbl = pd.DataFrame({
+    mode_tbl = pd.DataFrame({
         "community": [f"C{int(i)}" for i in dom_top["community_id"]],
-        "top_topic": dom_top["topic_id"].astype(int).values,
-        "share": dom_top["share"].values,
+        "mode_topic": dom_top["topic_id"].astype(int).values,
+        "plurality": dom_top["share"].values,
         "label / keywords": [str(l) for l in dom_top["label"]],
     })
+    # Sort alphabetically by community for consistent comparison with dist_tbl
+    mode_tbl = mode_tbl.sort_values("community", key=lambda x: x.str.extract(r'C(\d+)')[0].astype(int)).reset_index(drop=True)
+    max_plurality = float(dom_top["share"].max())
 
-    # Topics shared across communities + per-community diversity.
-    shared = data.community_topics.groupby("topic_id")["community_id"].nunique()
-    n_shared = int((shared > 1).sum())
-    diversity = ctx["profile"]["topic_diversity"].sort_values(ascending=False)
+    # Distinctive topics per community (lift = community share / corpus share):
+    # the topics a community is actually built around, not just its biggest one.
+    prof_by_vol = profile.sort_values("messages", ascending=False)
+    dist_rows = []
+    for cid in prof_by_vol.index:
+        items = ctx["distinctive"].get(int(cid), [])
+        if not items:
+            continue
+        tid, lift, cnt = items[0]
+        dist_rows.append({
+            "community": f"C{int(cid)}",
+            "topic": int(tid),
+            "lift": round(lift, 1),
+            "messages": int(cnt),
+            "label / keywords": str(label_of.get(tid, "")),
+        })
+    dist_tbl = pd.DataFrame(dist_rows)
+    # Sort alphabetically by community for consistent comparison with mode_tbl
+    dist_tbl = dist_tbl.sort_values("community", key=lambda x: x.str.extract(r'C(\d+)')[0].astype(int)).reset_index(drop=True)
+
+    # Noise reduced via outlier reassignment; report the residual and its spread.
+    noise_lo = float(profile["noise_rate"].min())
+    noise_hi = float(profile["noise_rate"].max())
+
+    # Topic diversity per community (raw distinct-topic count). Kept for context,
+    # but flagged as sample-size-driven — see Section 10 for the normalized view.
+    div_series = profile["topic_diversity"].sort_values(ascending=True)
+    div_series.index = [f"C{int(i)}" for i in div_series.index]
+    fig_div = viz.bar(
+        div_series, "Topic diversity per community (distinct topics)",
+        "distinct topics", "community", "topic_diversity_by_community.png",
+        color="#6a3ba5",
+    )
 
     return "\n".join([
         "## 6. Topic Analysis",
         "",
         f"BERTopic produced **{len(real)} topics** from {len(data.message_topics):,} "
-        f"modeled messages. The noise bucket (`-1`) absorbs **{_pct(noise_share)}** of "
-        "assignments — short or generic messages with no stable topic.",
+        "modeled messages. Default HDBSCAN leaves ~48% of short social-media messages "
+        "as outliers — and those outliers are **not** shorter than clustered messages, "
+        "so the bucket is a clustering artifact, not a data-quality signal. We therefore "
+        "reassign outliers to their nearest topic above a cosine floor, leaving a residual "
+        f"noise bucket of **{_pct(noise_share)}** of assignments (genuinely un-clusterable "
+        "content).",
         "",
         "### Most frequent topics",
         "",
@@ -633,18 +864,41 @@ def section_06_topics(data: ReportData, ctx: dict) -> str:
         "_A few large topics capture mainstream narratives; the long tail of small topics "
         "reflects niche or fast-moving content._",
         "",
-        "### Dominant topic per community",
+        "### Distinctive topics per community (lift)",
         "",
-        viz.md_table(dom_tbl, max_rows=CONFIG.top_communities, floatfmt=".3f"),
+        "Lift = a topic's share inside a community divided by its share in the whole "
+        "corpus. Unlike the raw mode, lift reveals what each community is *characteristically* "
+        "about rather than which global topic happens to be largest.",
         "",
-        f"- **{n_shared} topics** are dominant in more than one community — evidence that "
-        "core narratives are shared across structurally separate groups.",
-        "- **Most thematically diverse communities:** "
-        + ", ".join(f"C{int(i)} ({int(v)} topics)" for i, v in diversity.head(3).items())
-        + "; the narrowest carry only a handful of distinct topics.",
+        viz.md_table(dist_tbl, max_rows=20, floatfmt=".1f"),
         "",
-        "_What this answers: communities differ sharply in thematic breadth, yet the "
-        "biggest topics recur across communities — narrative reuse is structural, not isolated._",
+        "_These over-represented topics separate the communities into recognisable "
+        "misinformation genres — anti-vaccine, alternative-medicine, geopolitical, "
+        "religious-extremist — that the raw 'most common topic' completely hides._",
+        "",
+        "### Most common topic per community (for contrast)",
+        "",
+        viz.md_table(mode_tbl, max_rows=20, floatfmt=".3f"),
+        "",
+        f"- The modal topic captures at most **{_pct(max_plurality)}** of a community's "
+        "messages — these are weak pluralities over a flat, long-tailed distribution, not "
+        "true dominance. The same one or two globally-large topics top many communities, "
+        "which is why the lift view above is the more informative cut.",
+        "",
+        "### Topic coverage and breadth",
+        "",
+        viz.md_image(fig_div, "Topic diversity per community"),
+        "",
+        f"- **Noise coverage is uneven:** the residual outlier rate ranges from "
+        f"{_pct(noise_lo)} to {_pct(noise_hi)} across communities, so per-community topic "
+        "figures rest on different fractions of each group's messages.",
+        "- Distinct-topic *counts* rise with message volume — a rarefaction effect. "
+        "Section 10 normalizes for size and shows breadth-per-message actually **falls** as "
+        "communities grow.",
+        "",
+        "_What this answers: communities are thematically distinct once you control for the "
+        "globally-popular topics (via lift); apparent 'shared dominance' is mostly an "
+        "artifact of a few large topics plus a flat per-community distribution._",
         "",
     ])
 
@@ -784,18 +1038,13 @@ def section_08_emotion(data: ReportData, ctx: dict) -> str:
     )
 
     # Emotion x community heatmap (share of dominant emotion within each community).
-    top_comms = (
-        ctx["profile"].sort_values("messages", ascending=False)
-        .head(CONFIG.top_emotion_communities).index
-    )
-    sub = msg[msg["community_id"].isin(top_comms)]
     share = (
-        pd.crosstab(sub["community_id"], sub["dominant_emotion"], normalize="index")
+        pd.crosstab(msg["community_id"], msg["dominant_emotion"], normalize="index")
         .reindex(columns=emotions + ["neutral"], fill_value=0)
     )
     share.index = [f"C{int(i)}" for i in share.index]
     fig_heat = viz.heatmap(
-        share[emotions], "Emotion share by community (top communities)",
+        share[emotions], "Emotion share by community (all communities)",
         "emotion_by_community.png", cbar_label="share of messages",
     )
 
@@ -824,16 +1073,30 @@ def section_08_emotion(data: ReportData, ctx: dict) -> str:
 
     pos, neg = msg["positive_score"].mean(), msg["negative_score"].mean()
 
+    # Surface neutral: it is excluded from the per-community "dominant emotion"
+    # (which reports the leading *non-neutral* register), but it is frequently the
+    # actual plurality, so the dominant-emotion labels overstate affect.
+    neutral_share = float((msg["dominant_emotion"] == "neutral").mean())
+    full_share_all = pd.crosstab(msg["community_id"], msg["dominant_emotion"], normalize="index")
+    n_neutral_plurality = int((full_share_all.idxmax(axis=1) == "neutral").sum())
+    n_comms = full_share_all.shape[0]
+
     return "\n".join([
         "## 8. Sentiment and Emotion Analysis",
         "",
         f"All {len(data.emotions):,} messages carry NRC emotion scores. Mean polarity is "
-        f"**{pos:.2f} positive / {neg:.2f} negative** — the corpus leans negative.",
+        f"**{pos:.2f} positive / {neg:.2f} negative** — the corpus leans slightly negative.",
         "",
         viz.md_image(fig_dist, "Dominant emotion distribution"),
         "",
-        "_Negatively-valenced emotions (anger, fear) and trust lead; surprise and joy are "
-        "rare. `neutral` marks messages with no lexicon match._",
+        f"> **Read the dominant-emotion labels with care.** `neutral` (no lexicon match) is "
+        f"the single largest class at **{_pct(neutral_share)}** of messages and is the actual "
+        f"plurality in **{n_neutral_plurality}/{n_comms}** communities. The per-community and "
+        "per-channel 'dominant emotion' reported below is the leading *non-neutral* register, "
+        "so it overstates how emotionally-charged the average message is.",
+        "",
+        "_Among non-neutral emotions, anger, trust, and anticipation lead; surprise and joy "
+        "are rare._",
         "",
         "### Emotion profile by community",
         "",
@@ -876,18 +1139,14 @@ def section_09_temporal(data: ReportData, ctx: dict) -> str:
     msg = data.msg.copy()
     emotions = list(CONFIG.emotion_categories)
 
-    # Community activity over time (top 4 communities by volume).
-    top_comms = (
-        ctx["profile"].sort_values("messages", ascending=False).head(4).index
-    )
-    pivot = (
-        msg[msg["community_id"].isin(top_comms)]
-        .pivot_table(index="month", columns="community_id", values="message_id",
-                     aggfunc="count", fill_value=0)
+    # Community activity over time (all communities).
+    pivot = msg.pivot_table(
+        index="month", columns="community_id", values="message_id",
+        aggfunc="count", fill_value=0,
     )
     pivot.columns = [f"C{int(c)}" for c in pivot.columns]
     fig_comm = viz.line(
-        pivot, "Monthly activity of the largest communities",
+        pivot, "Monthly activity by community",
         "month", "messages", "temporal_community_activity.png",
     )
 
@@ -902,6 +1161,46 @@ def section_09_temporal(data: ReportData, ctx: dict) -> str:
         "month", "share of messages", "temporal_emotion_share.png",
     )
 
+    # Quarterly emotion trends — coarser bins + un-stacked lines make each
+    # emotion's direction (rising/falling) far easier to read than the area chart.
+    msg["quarter"] = msg["date_parsed"].dt.to_period("Q").astype(str)
+    lead_emotions = [
+        e for e in msg["dominant_emotion"].value_counts().index if e != "neutral"
+    ][:5]
+    emo_q = (
+        pd.crosstab(msg["quarter"], msg["dominant_emotion"], normalize="index")
+        .reindex(columns=lead_emotions, fill_value=0)
+    )
+    fig_q = viz.line(
+        emo_q, "Emotion share by quarter (leading emotions)",
+        "quarter", "share of messages", "temporal_emotion_quarterly.png",
+    )
+
+    # Early vs late shift: first 12 months vs last 12 months of activity.
+    dates = msg["date_parsed"]
+    early_cut = dates.min() + pd.DateOffset(months=12)
+    late_cut = dates.max() - pd.DateOffset(months=12)
+    early = msg[dates < early_cut]["dominant_emotion"].value_counts(normalize=True)
+    late = msg[dates >= late_cut]["dominant_emotion"].value_counts(normalize=True)
+    emo_cols = list(CONFIG.emotion_categories)
+    early = early.reindex(emo_cols, fill_value=0)
+    late = late.reindex(emo_cols, fill_value=0)
+    delta = (late - early) * 100
+    trend_tbl = pd.DataFrame({
+        "emotion": emo_cols,
+        "early %": (early.values * 100),
+        "late %": (late.values * 100),
+        "change (pp)": delta.values,
+    }).sort_values("change (pp)", key=lambda s: s.abs(), ascending=False)
+
+    def _movement(emotion: str) -> str:
+        """Phrase one emotion's early→late shift in percentage points."""
+        d = float(delta.get(emotion, 0.0))
+        verb = "rose" if d >= 0 else "fell"
+        return f"{emotion} {verb} {abs(d):.1f} pp"
+
+    movers = ", ".join(_movement(e) for e in trend_tbl["emotion"].head(2))
+
     # Sentiment volatility per community: std of monthly net polarity.
     msg["net"] = msg["positive_score"] - msg["negative_score"]
     monthly_net = msg.pivot_table(index="month", columns="community_id",
@@ -911,7 +1210,7 @@ def section_09_temporal(data: ReportData, ctx: dict) -> str:
         "community": [f"C{int(i)}" for i in volatility.index],
         "net_polarity_volatility": volatility.values,
         "mean_net_polarity": monthly_net.mean().reindex(volatility.index).values,
-    }).head(CONFIG.top_n_table)
+    })
 
     return "\n".join([
         "## 9. Temporal Analysis",
@@ -920,7 +1219,7 @@ def section_09_temporal(data: ReportData, ctx: dict) -> str:
         "",
         "### Community activity over time",
         "",
-        viz.md_image(fig_comm, "Monthly activity of the largest communities"),
+        viz.md_image(fig_comm, "Monthly activity by community"),
         "",
         "_Communities rise and fall at different times — activity is event-driven, not "
         "steady, and leadership of the conversation shifts between groups._",
@@ -932,17 +1231,55 @@ def section_09_temporal(data: ReportData, ctx: dict) -> str:
         "_The emotional mix is not stable: periods of elevated anger/fear alternate with "
         "calmer trust/anticipation phases, suggesting reactive responses to external events._",
         "",
+        "### Emotion shift, quarterly",
+        "",
+        "The monthly area chart shows churn but hides direction. Aggregating to quarters and "
+        "drawing each emotion as its own line makes net rises and falls explicit.",
+        "",
+        viz.md_image(fig_q, "Emotion share by quarter"),
+        "",
+        f"Comparing the first 12 months of activity with the last 12: **{movers}** (largest "
+        "movers). Full breakdown:",
+        "",
+        viz.md_table(trend_tbl, max_rows=10, floatfmt=".1f"),
+        "",
+        "_What this answers: beyond month-to-month noise, the corpus shows a directional "
+        "emotional drift — some registers structurally gain ground while others recede._",
+        "",
         "### Sentiment volatility by community",
         "",
         "Standard deviation of monthly net polarity (positive − negative) measures "
         "emotional stability: high values = volatile mood, low = consistent tone.",
         "",
-        viz.md_table(vol_tbl, max_rows=CONFIG.top_n_table, floatfmt=".4f"),
+        viz.md_table(vol_tbl, max_rows=20, floatfmt=".4f"),
         "",
         "_What this answers: some communities keep a stable emotional profile while others "
         "swing sharply — the volatile ones are the most reactive to events._",
         "",
     ])
+
+
+def _pearson_ci(r: float, n: int, z: float = 1.96) -> tuple[float, float]:
+    """
+    Approximate 95% confidence interval for a Pearson r via Fisher's z.
+
+    With only ~12 communities, point correlations are very uncertain; the CI
+    makes that explicit instead of quoting a bare r.
+
+    Args:
+        r: Pearson correlation coefficient.
+        n: Number of observations.
+        z: Normal critical value (1.96 for ~95%).
+
+    Returns:
+        (low, high) correlation bounds, clipped to [-1, 1].
+    """
+    if n < 4 or abs(r) >= 1.0:
+        return (r, r)
+    zr = np.arctanh(r)
+    se = 1.0 / np.sqrt(n - 3)
+    lo, hi = np.tanh(zr - z * se), np.tanh(zr + z * se)
+    return (float(np.clip(lo, -1, 1)), float(np.clip(hi, -1, 1)))
 
 
 # ----------------------------------------------------------------------------
@@ -978,27 +1315,38 @@ def section_10_cross_layer(data: ReportData, ctx: dict) -> str:
         "crosslayer_emotion_by_topic.png", cbar_label="share",
     )
 
-    # Community-level correlation among layer metrics.
-    metrics = profile[["channels", "messages", "users", "topic_diversity",
-                       "avg_similarity", "negative_score"]].copy()
-    metrics = metrics.rename(columns={"negative_score": "neg_polarity"}).astype(float)
+    # Community-level correlation among layer metrics. Both the raw distinct-topic
+    # count and the size-normalized diversity are included so the sampling
+    # confound is visible rather than hidden.
+    metrics = profile[["messages", "users", "topic_diversity", "topics_per_1k",
+                       "topic_evenness", "avg_similarity", "negative_score"]].copy()
+    metrics = metrics.rename(columns={
+        "negative_score": "neg_polarity",
+        "topic_diversity": "topic_count",
+        "topics_per_1k": "topics_per_1k",
+        "topic_evenness": "evenness",
+    }).astype(float)
     corr = metrics.corr()
     fig_corr = viz.heatmap(
         corr, "Community-level metric correlations",
         "crosslayer_correlation.png", cmap="coolwarm", cbar_label="Pearson r",
     )
 
-    # Scatter: community size vs topic diversity.
+    # Scatter: community size vs raw distinct-topic count (the rarefaction trap).
     fig_sc = viz.scatter(
         profile["messages"].astype(float), profile["topic_diversity"].astype(float),
         [f"C{int(i)}" for i in profile.index],
-        "Community message volume vs topic diversity",
+        "Community message volume vs distinct topic count",
         "messages", "distinct topics", "crosslayer_size_vs_diversity.png",
     )
 
-    # A couple of computed correlations to narrate.
-    r_size_div = float(metrics["messages"].corr(metrics["topic_diversity"]))
+    # Correlations with 95% CIs (n is small, so report the interval).
+    n = len(profile)
+    r_count = float(metrics["messages"].corr(metrics["topic_count"]))
+    r_norm = float(metrics["messages"].corr(metrics["topics_per_1k"]))
+    r_even = float(metrics["messages"].corr(metrics["evenness"]))
     r_neg_sim = float(metrics["neg_polarity"].corr(metrics["avg_similarity"]))
+    ci_count, ci_norm = _pearson_ci(r_count, n), _pearson_ci(r_norm, n)
 
     return "\n".join([
         "## 10. Cross-Layer Analysis",
@@ -1014,21 +1362,31 @@ def section_10_cross_layer(data: ReportData, ctx: dict) -> str:
         "",
         "### Community-level correlations",
         "",
+        f"> **Caveat:** each correlation below is over only **n = {n} communities**, so "
+        "the 95% confidence intervals are wide. Read these as directional, not precise.",
+        "",
         viz.md_image(fig_corr, "Community metric correlations"),
         "",
-        viz.md_image(fig_sc, "Community size vs topic diversity"),
+        viz.md_image(fig_sc, "Community size vs distinct topic count"),
         "",
-        f"- Message volume vs topic diversity: **r = {r_size_div:.2f}** — larger "
-        "communities are "
-        + ("more thematically diverse" if r_size_div > 0.2 else
-           "not simply more diverse (breadth is not just a volume effect)") + ".",
+        "**Does size drive thematic diversity? Only as an artifact.**",
+        "",
+        f"- Volume vs distinct topic *count*: **r = {r_count:.2f}** "
+        f"(95% CI {ci_count[0]:.2f}–{ci_count[1]:.2f}). But a topic *count* mechanically "
+        "grows with sample size (rarefaction): more messages hit more topic buckets.",
+        f"- Volume vs **topics per 1k messages**: **r = {r_norm:.2f}** "
+        f"(95% CI {ci_norm[0]:.2f}–{ci_norm[1]:.2f}) — the sign **flips**. Normalized for "
+        "size, larger communities are *less* diverse per message, not more.",
+        f"- Volume vs topic **evenness** (Pielou): **r = {r_even:.2f}** — essentially flat. "
+        "Diversity of the topic *mix* is unrelated to how active a community is.",
         f"- Negative polarity vs internal similarity: **r = {r_neg_sim:.2f}** — "
         + ("more negative communities also repeat content more" if r_neg_sim > 0.2 else
-           "emotional negativity and content redundancy are largely independent") + ".",
+           "emotional negativity and content redundancy look largely independent")
+        + " (but see the n caveat).",
         "",
-        "_What this answers: structure, topic, semantics, and emotion are partially "
-        "coupled — volume drives breadth, while emotion aligns more with topic than with "
-        "raw community size._",
+        "_What this answers: the headline 'bigger communities are more diverse' is a "
+        "sampling artifact — once you divide by message volume it reverses. Emotion aligns "
+        "with topic far more than with raw community size._",
         "",
     ])
 
@@ -1048,11 +1406,14 @@ def section_11_statistics(data: ReportData, ctx: dict) -> str:
         Markdown for the statistical summary section.
     """
     profile = ctx["profile"].copy()
+    n = len(profile)
     cols = {
         "channels": "channels",
         "messages": "messages",
         "users": "users",
-        "topic_diversity": "topics",
+        "topic_diversity": "topic_count",
+        "topics_per_1k": "topics_per_1k",
+        "topic_evenness": "evenness",
         "avg_similarity": "avg_sim",
         "net_polarity": "net_polarity",
     }
@@ -1063,14 +1424,20 @@ def section_11_statistics(data: ReportData, ctx: dict) -> str:
     return "\n".join([
         "## 11. Statistical Summary",
         "",
-        "Descriptive statistics across the 12 communities (each community is one "
+        f"Descriptive statistics across the {n} communities (each community is one "
         "observation). This quantifies the imbalance described qualitatively above.",
         "",
         viz.md_table(desc, max_rows=10, floatfmt=".2f"),
         "",
+        f"> With **n = {n}**, community-level summaries and correlations are low-power: "
+        "standard deviations are large and any single community can move a statistic. The "
+        "figures describe *this* corpus; they do not support strong population-level claims.",
+        "",
         "_Large standard deviations relative to means (especially for messages and users) "
-        "confirm a heavy-tailed structure: a few communities dominate every metric. "
-        "Topic breadth and similarity are more evenly spread._",
+        "confirm a heavy-tailed structure: a few communities dominate raw volume. Note the "
+        "split in the diversity metrics — the distinct-topic *count* is heavy-tailed, but "
+        "evenness (the size-normalized mix) is tight, underlining that 'breadth' is mostly "
+        "a volume effect._",
         "",
     ])
 
@@ -1096,8 +1463,26 @@ def section_12_findings(data: ReportData, ctx: dict) -> str:
     noise_share = float((data.message_topics["topic_id"] == CONFIG.noise_topic_id).mean())
     biggest = profile.sort_values("messages", ascending=False).iloc[0]
     biggest_share = float(biggest["messages"]) / float(profile["messages"].sum())
+    neutral_share = float((data.msg["dominant_emotion"] == "neutral").mean())
     neg_lead = data.msg["dominant_emotion"].value_counts()
     top_emo = [e for e in neg_lead.index if e != "neutral"][0]
+    pos_m = float(data.msg["positive_score"].mean())
+    neg_m = float(data.msg["negative_score"].mean())
+
+    # Distinctiveness coverage + a representative lift figure. Use the max lift
+    # among the larger communities (those shown in the Section 6 table) so the
+    # cited number matches the table rather than an extreme from a 2-channel group.
+    n_distinctive = sum(1 for v in ctx["distinctive"].values() if v)
+    items = [(c, t, lift, n) for c, lst in ctx["distinctive"].items() for (t, lift, n) in lst]
+    big_comms = set(
+        int(i) for i in profile.sort_values("messages", ascending=False)
+        .head(CONFIG.top_communities).index
+    )
+    top_lift = max((lift for c, _, lift, _ in items if int(c) in big_comms), default=0.0)
+
+    # Size-normalized diversity correlation (the rarefaction reversal).
+    m = profile.astype({"messages": float, "topics_per_1k": float})
+    r_norm = float(m["messages"].corr(m["topics_per_1k"]))
 
     findings = [
         ("Well-separated community structure",
@@ -1110,26 +1495,36 @@ def section_12_findings(data: ReportData, ctx: dict) -> str:
          "A handful of channels/communities drive the corpus; moderation or study effort "
          "targeted there covers most of the volume.",
          "V1 structure + V2 / Phase 1"),
-        ("Narratives are reused across communities",
-         f"{_pct(cross_share)} of {len(sim):,} near-duplicate pairs cross community lines; "
-         "several top topics dominate multiple communities.",
-         "The same content is repackaged across structurally distinct groups — consistent "
-         "with coordinated or template-driven diffusion.",
+        ("Communities have distinct thematic identities",
+         f"{n_distinctive} communities carry topics over-represented vs the corpus (lift up "
+         f"to ×{top_lift:.0f}) — e.g. anti-vaccine, alternative-medicine, geopolitical, and "
+         "religious-extremist clusters.",
+         "Beneath a few globally-popular topics, the groups specialise in recognisable "
+         "misinformation genres — visible via lift, hidden by the raw modal topic.",
+         "V2 / Phase 2"),
+        ("Narratives are also reused across communities",
+         f"{_pct(cross_share)} of {len(sim):,} near-duplicate pairs cross community lines.",
+         "Distinct identities coexist with shared templates: the same content is repackaged "
+         "across structurally separate groups — consistent with coordinated diffusion.",
          "V2 / Phases 2 & 3"),
-        ("The corpus leans negative",
-         f"'{top_emo}' is the leading non-neutral emotion; mean negative polarity exceeds "
-         "positive.",
-         "Affective framing skews toward anger/fear, typical of mobilizing misinformation.",
+        ("Tone is neutral-heavy with a mild negative lean",
+         f"`neutral` is the plurality ({_pct(neutral_share)}); among non-neutral messages "
+         f"'{top_emo}' leads and mean negative polarity ({neg_m:.2f}) marginally exceeds "
+         f"positive ({pos_m:.2f}).",
+         "Affective framing skews to anger/fear when present, but most messages carry no "
+         "lexicon emotion — the negative lean is real but modest.",
          "V2 / Phase 4"),
-        ("Emotion tracks topic more than size",
-         "Emotion×topic shows stable per-topic affect; community-level correlations are "
-         "weak between size and negativity.",
-         "Tone is driven by *what* is discussed, not merely by *how active* a group is.",
+        ("Topic diversity is a sample-size artifact, not a real effect",
+         f"Distinct-topic count rises with volume, but topics-per-message *falls* "
+         f"(r = {r_norm:.2f}) and evenness is flat.",
+         "Larger communities are not more thematically diverse once normalized for activity; "
+         "the raw count correlation is rarefaction.",
          "V2 / Cross-layer"),
-        ("Topic noise is substantial",
-         f"{_pct(noise_share)} of modeled messages fall in BERTopic's noise bucket.",
-         "Short, generic, or boilerplate messages resist topic assignment — a caveat for "
-         "any topic-based conclusion.",
+        ("Topic noise was a clustering artifact, now controlled",
+         f"Default HDBSCAN flagged ~48% of messages as outliers though they are not shorter "
+         f"than clustered ones; reassignment leaves a {_pct(noise_share)} residual.",
+         "The original noise rate reflected default parameters on short text, not data "
+         "quality; reassigned outliers are lower-confidence and flagged as such.",
          "V2 / Phase 2"),
     ]
 
@@ -1159,14 +1554,22 @@ def section_13_limitations(data: ReportData, ctx: dict) -> str:
     Returns:
         Markdown for the limitations section.
     """
+    noise_share = float((data.message_topics["topic_id"] == CONFIG.noise_topic_id).mean())
     return "\n".join([
         "## 13. Limitations",
         "",
-        "- **Topic noise.** A large share of messages land in BERTopic's `-1` bucket; "
-        "topic-level figures describe only the modeled subset.",
+        "- **Outlier reassignment.** Default HDBSCAN flags ~48% of messages as outliers; we "
+        "reassign those above an embedding-cosine floor to their nearest topic, leaving a "
+        f"{_pct(noise_share)} residual. Reassigned messages are lower-confidence (low "
+        "assignment probability) and should be read as best-fit, not firm, topic membership.",
+        "- **Low statistical power (n = 12).** Community-level statistics and correlations "
+        "rest on twelve observations; confidence intervals are wide and individual "
+        "communities can swing a coefficient.",
         "- **Lexicon emotion.** NRC is a bag-of-words lexicon: it misses negation, "
-        "sarcasm, irony, and context, and Portuguese coverage is imperfect. Scores are "
-        "indicative, not ground truth.",
+        "sarcasm, irony, and context, and Portuguese coverage is imperfect; `neutral` (no "
+        "match) is the largest class. Scores are indicative, not ground truth.",
+        "- **Language detection.** Non-Portuguese messages are dropped via langdetect before "
+        "modeling, which is itself imperfect on very short text.",
         "- **Community detection scope.** Communities are detected on the channel "
         "interaction graph only; users and messages inherit a community via their channel.",
         "- **Similarity truncation.** `SIMILAR_TO` keeps only pairs ≥ "

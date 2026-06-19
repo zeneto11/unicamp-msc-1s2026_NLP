@@ -107,8 +107,23 @@ EMAIL_PLACEHOLDER_RE = re.compile(r"<\w+>")                          # <EMAIL>, 
 # '>' is mojibake debris (e.g. "<ç<÷B<÷<úR<î<óI") that would otherwise leak
 # fragment tokens like "úr"/"ói" into TF-IDF. Drop the whole offending token.
 ANGLE_DEBRIS_RE = re.compile(r"\S*[<>]\S*")
+# Quoted-printable decode debris: an '=' glued to a high-Latin character
+# (e.g. '=ÚIsso', '=ÑBaixe', '=Þ') is a mangled '=XX' escape, not real text.
+# Stripped before the Portuguese-letter preservation step so combos like '=Ú'
+# (where Ú is otherwise a valid PT letter) are removed.
+QP_DEBRIS_RE = re.compile(r"=[-ÿ]")
 HEX_RE = re.compile(r"\b[0-9a-f]{10,}\b", re.IGNORECASE)             # leftover hex from URL paths
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")             # binary corruption (keeps \t\n\r)
+# Latin-1 supplement letters outside the Portuguese alphabet are emoji/encoding
+# decode artifacts (e.g. 'Ï', 'Ø', or 'ý' glued onto a word as in 'ýnosso').
+# Replace them with a space so they neither merge words nor leak fragment tokens
+# into TF-IDF / topic labels. Valid Portuguese accents are explicitly preserved.
+_PT_LATIN1 = set("ÀÁÂÃÇÉÊÍÓÔÕÚÜàáâãçéêíóôõúü")
+_NONPT_LATIN1 = "".join(
+    chr(c) for c in range(0x00C0, 0x0100)
+    if chr(c).isalpha() and chr(c) not in _PT_LATIN1
+)
+ARTIFACT_LETTERS_RE = re.compile(f"[{re.escape(_NONPT_LATIN1)}]")
 MULTISPACE_RE = re.compile(r"\s+")
 
 Path(OUTPUT_PORTUGUESE).parent.mkdir(
@@ -250,6 +265,13 @@ def clean_analysis_text(value):
 
     # Drop binary control characters left by decoding damage
     s = CONTROL_RE.sub(" ", s)
+
+    # Drop quoted-printable decode debris ('=' + high-Latin char) before the
+    # Latin-1 step, so '=Ú'-style combos are removed even though Ú is valid PT
+    s = QP_DEBRIS_RE.sub(" ", s)
+
+    # Drop non-Portuguese Latin-1 letters (emoji/encoding decode artifacts)
+    s = ARTIFACT_LETTERS_RE.sub(" ", s)
 
     # Collapse runs of whitespace produced by the substitutions
     s = MULTISPACE_RE.sub(" ", s).strip()

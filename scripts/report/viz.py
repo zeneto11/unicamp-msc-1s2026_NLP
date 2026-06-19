@@ -104,7 +104,8 @@ def bar(
     ylabel: str,
     filename: str,
     horizontal: bool = True,
-    color: str = "#3b6ea5",
+    color="#3b6ea5",
+    log: bool = False,
 ) -> str:
     """
     Render a bar chart from a labelled series (index = categories).
@@ -116,7 +117,8 @@ def bar(
         ylabel: Y-axis label.
         filename: Output figure file name.
         horizontal: Draw horizontal bars when True.
-        color: Bar colour.
+        color: Bar colour, or a list of per-bar colours.
+        log: Use a logarithmic value axis (helps when bars span orders of magnitude).
 
     Returns:
         Output figure file name.
@@ -127,6 +129,8 @@ def bar(
     plt.title(title)
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
+    if log:
+        (plt.xscale if horizontal else plt.yscale)("log")
     if not horizontal:
         plt.xticks(rotation=45, ha="right")
     _save(filename)
@@ -188,12 +192,18 @@ def line(
         Output figure file name.
     """
     plt.figure()
+    if df.shape[1] > 8:
+        # tab20 gives 20 distinct colors; avoids color cycling when there are
+        # more series than the default tab10 cycle (10 colors).
+        colors = [plt.cm.tab20(i / max(df.shape[1] - 1, 1)) for i in range(df.shape[1])]
+        plt.gca().set_prop_cycle(color=colors)
     df.plot(ax=plt.gca(), marker="", linewidth=1.6)
     plt.title(title)
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
     if df.shape[1] > 1:
-        plt.legend(fontsize=8, ncol=2)
+        ncol = 3 if df.shape[1] > 6 else 2
+        plt.legend(fontsize=8, ncol=ncol)
     if rotate:
         plt.xticks(rotation=45, ha="right")
     _save(filename)
