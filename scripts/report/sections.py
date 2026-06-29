@@ -1042,9 +1042,18 @@ def section_08_emotion(data: ReportData, ctx: dict) -> str:
         pd.crosstab(msg["community_id"], msg["dominant_emotion"], normalize="index")
         .reindex(columns=emotions + ["neutral"], fill_value=0)
     )
-    share.index = [f"C{int(i)}" for i in share.index]
+    # Label each community row with its top descriptive keywords so the emotional
+    # profile reads on its own, without cross-referencing the community table.
+    kw_map = {
+        int(cid): " · ".join(str(name).split(" · ")[:3])
+        for cid, name in zip(data.communities["id"], data.communities["community_name"])
+    }
+    share.index = [
+        f"C{int(i)}: {kw_map[int(i)]}" if kw_map.get(int(i)) else f"C{int(i)}"
+        for i in share.index
+    ]
     fig_heat = viz.heatmap(
-        share[emotions], "Emotion share by community (all communities)",
+        share[emotions], "Emotion share by community (with descriptive keywords)",
         "emotion_by_community.png", cbar_label="share of messages",
     )
 
@@ -1164,16 +1173,15 @@ def section_09_temporal(data: ReportData, ctx: dict) -> str:
     # Quarterly emotion trends — coarser bins + un-stacked lines make each
     # emotion's direction (rising/falling) far easier to read than the area chart.
     msg["quarter"] = msg["date_parsed"].dt.to_period("Q").astype(str)
-    lead_emotions = [
-        e for e in msg["dominant_emotion"].value_counts().index if e != "neutral"
-    ][:5]
+    # Show every emotion (including the rare joy/disgust/surprise), not just the
+    # leading few — the per-quarter normalization is unchanged.
     emo_q = (
         pd.crosstab(msg["quarter"], msg["dominant_emotion"], normalize="index")
-        .reindex(columns=lead_emotions, fill_value=0)
+        .reindex(columns=emotions, fill_value=0)
     )
-    fig_q = viz.line(
-        emo_q, "Emotion share by quarter (leading emotions)",
-        "quarter", "share of messages", "temporal_emotion_quarterly.png",
+    fig_q = viz.quarter_line(
+        emo_q, "Emotion share by quarter (all emotions)",
+        "share of messages", "temporal_emotion_quarterly.png",
     )
 
     # Early vs late shift: first 12 months vs last 12 months of activity.

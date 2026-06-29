@@ -43,4 +43,4 @@ data/
 figures/
 # reports/
 import/
-latex/
+latex/*

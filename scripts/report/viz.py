@@ -210,6 +210,58 @@ def line(
     return filename
 
 
+def quarter_line(
+    df: pd.DataFrame,
+    title: str,
+    ylabel: str,
+    filename: str,
+) -> str:
+    """
+    Render emotion-share lines over quarters with grouped year/quarter ticks.
+
+    The x index is a sorted sequence of period strings like ``2020Q1``. Instead
+    of rotating the full period label on every tick (hard to read), each tick is
+    drawn as ``Q1..Q4`` with the year printed only under the first quarter of the
+    year, giving a clean grouped axis. Every column (emotion) is drawn as its own
+    line so low-frequency registers (joy, disgust, surprise) stay visible.
+
+    Args:
+        df: DataFrame indexed by quarter period strings; columns are emotions.
+        title: Plot title.
+        ylabel: Y-axis label.
+        filename: Output figure file name.
+
+    Returns:
+        Output figure file name.
+    """
+    plt.figure(figsize=(11, 5))
+    n = df.shape[1]
+    if n > 8:
+        colors = [plt.cm.tab20(i / max(n - 1, 1)) for i in range(n)]
+        plt.gca().set_prop_cycle(color=colors)
+
+    x = list(range(len(df.index)))
+    for col in df.columns:
+        plt.plot(x, df[col].to_numpy(), linewidth=1.8, label=col)
+
+    # Grouped tick labels: quarter number always, year only under Q1.
+    labels = []
+    for period in df.index:
+        s = str(period)            # e.g. '2020Q1'
+        year, quarter = s[:4], s[-1]
+        labels.append(f"Q{quarter}\n{year}" if quarter == "1" else f"Q{quarter}")
+    plt.xticks(x, labels, fontsize=8)
+
+    plt.title(title)
+    plt.xlabel("quarter")
+    plt.ylabel(ylabel)
+    # Lines cluster in the lower band, so the legend sits in the empty top area.
+    plt.legend(fontsize=8, ncol=4, loc="upper center", framealpha=0.9)
+    plt.margins(x=0.01)
+    _save(filename)
+    return filename
+
+
 def stacked_area(
     df: pd.DataFrame,
     title: str,

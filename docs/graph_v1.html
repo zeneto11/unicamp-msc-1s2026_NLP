@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Graph V1 — Node &amp; Relation Types</title>
+    <style>
+      @import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600;700&display=swap");
+
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+
+      body {
+        background: #f4f1eb;
+        font-family: "IBM Plex Sans", sans-serif;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 100vh;
+        padding: 40px 20px;
+      }
+
+      .diagram-wrapper {
+        background: #faf8f4;
+        border: 2px solid #ccc;
+        padding: 10px;
+        position: relative;
+        width: fit-content;
+        min-width: 480px;
+      }
+
+      /* ── TOPOLOGY ── */
+      .topology-wrap {
+        background: #fff;
+        border: 1.5px solid #ccc;
+        border-radius: 3px;
+        padding: 12px 14px;
+      }
+      .topology-title {
+        font-family: "IBM Plex Mono", monospace;
+        font-size: 10px;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: #aaa;
+        margin-bottom: 10px;
+      }
+      .topology {
+        display: flex;
+        align-items: center;
+        gap: 0;
+        flex-wrap: wrap;
+        row-gap: 8px;
+      }
+      .t-node {
+        font-family: "IBM Plex Mono", monospace;
+        font-size: 11px;
+        font-weight: 600;
+        border: 1.5px solid;
+        padding: 4px 10px;
+        border-radius: 2px;
+        white-space: nowrap;
+      }
+      .t-node.user {
+        border-color: #1a6eb5;
+        color: #1a6eb5;
+        background: #f0f6ff;
+      }
+      .t-node.chan {
+        border-color: #0a7a4a;
+        color: #0a7a4a;
+        background: #f0faf5;
+      }
+      .t-node.msg {
+        border-color: #7a3a0a;
+        color: #7a3a0a;
+        background: #fdf5ef;
+      }
+      .t-arrow {
+        font-family: "IBM Plex Mono", monospace;
+        font-size: 9px;
+        color: #aaa;
+        padding: 0 4px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        line-height: 1.2;
+      }
+
+      /* ── PRINT ── */
+      .ui-controls {
+        position: fixed;
+        bottom: 16px;
+        right: 16px;
+        display: flex;
+        gap: 8px;
+        z-index: 9999;
+      }
+      .ctrl-btn {
+        padding: 10px 14px;
+        border: 1px solid #111;
+        background: white;
+        font-family: "IBM Plex Mono", monospace;
+        font-size: 12px;
+        cursor: pointer;
+      }
+      .ctrl-btn:hover {
+        background: #f0f0f0;
+      }
+
+      @media print {
+        .ui-controls {
+          display: none !important;
+        }
+        body {
+          display: block;
+          min-height: unset;
+          background: #f4f1eb !important;
+          margin: 0;
+          padding: 0;
+          -webkit-print-color-adjust: exact;
+          print-color-adjust: exact;
+        }
+        .diagram-wrapper {
+          background: #faf8f4 !important;
+          -webkit-print-color-adjust: exact;
+          print-color-adjust: exact;
+          page-break-inside: avoid;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="ui-controls">
+      <button class="ctrl-btn" onclick="savePDF()">📄 Save PDF</button>
+    </div>
+    <script>
+      function savePDF() {
+        const fig = document.querySelector(".diagram-wrapper");
+        const rect = fig.getBoundingClientRect();
+        const pxToMm = 25.4 / 96;
+        const wMm = Math.ceil(rect.width * pxToMm) + 4;
+        const hMm = Math.ceil(rect.height * pxToMm) + 1;
+        const styleId = "__pdf_page_style__";
+        let style = document.getElementById(styleId);
+        if (!style) {
+          style = document.createElement("style");
+          style.id = styleId;
+          document.head.appendChild(style);
+        }
+        style.textContent = `@page { size: ${wMm}mm ${hMm}mm; margin: 1mm; }`;
+        window.print();
+      }
+    </script>
+
+    <div class="diagram-wrapper">
+      <div class="topology-wrap">
+        <div class="topology-title">Node &amp; Relation Types</div>
+
+        <!-- Row 1: core nodes -->
+        <div class="topology" style="margin-bottom: 10px">
+          <div class="t-node user">User</div>
+          <div class="t-arrow">─ POSTED ─▶</div>
+          <div class="t-node msg">Message</div>
+          <div class="t-arrow">─ IN_CHANNEL ─▶</div>
+          <div class="t-node chan">Channel</div>
+        </div>
+
+        <!-- Row 2: aggregated + reply -->
+        <div class="topology" style="margin-bottom: 10px">
+          <div class="t-node msg">Message</div>
+          <div class="t-arrow">─ REPLIES_TO ─▶</div>
+          <div class="t-node msg">Message</div>
+          <div style="width: 20px"></div>
+          <div class="t-node msg">Message</div>
+          <div class="t-arrow">─ REPLIES_INTO ─▶</div>
+          <div class="t-node chan">Channel</div>
+        </div>
+
+        <!-- Row 3: forward -->
+        <div class="topology">
+          <div class="t-node msg">Message</div>
+          <div class="t-arrow">─ FORWARDED_FROM ─▶</div>
+          <div class="t-node chan">Channel</div>
+          <div style="width: 20px"></div>
+          <div class="t-node user">User</div>
+          <div class="t-arrow">─ ACTIVE_IN ─▶</div>
+          <div class="t-node chan">Channel</div>
+        </div>
+
+        <!-- Row 4: forward -->
+        <div class="topology" style="margin-top: 10px">
+          <div class="t-node chan">Channel</div>
+          <div class="t-arrow">─ INTERACTS_WITH ─▶</div>
+          <div class="t-node chan">Channel</div>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>
